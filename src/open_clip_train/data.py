@@ -20,6 +20,9 @@ from torch.utils.data.distributed import DistributedSampler
 from webdataset.filters import _shuffle
 from webdataset.tariterators import base_plus_ext, url_opener, tar_file_expander, valid_sample
 
+# ... (在其他导入语句之后)
+from .spaglam_data import get_spaglam_dataset
+
 try:
     import horovod.torch as hvd
 except ImportError:
@@ -530,6 +533,10 @@ def get_dataset_fn(data_path, dataset_type):
         return get_csv_dataset
     elif dataset_type == "synthetic":
         return get_synthetic_dataset
+    # ==================== 新增部分 ====================
+    elif dataset_type == "spaglam":
+        return get_spaglam_dataset
+    # ================================================
     elif dataset_type == "auto":
         ext = data_path.split('.')[-1]
         if ext in ['csv', 'tsv']:

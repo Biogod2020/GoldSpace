@@ -61,7 +61,7 @@ def parse_args(args):
     )
     parser.add_argument(
         "--dataset-type",
-        choices=["webdataset", "csv", "synthetic", "auto"],
+        choices=["webdataset", "csv", "synthetic", "auto", "spaglam"],
         default="auto",
         help="Which type of dataset to process."
     )
@@ -478,6 +478,22 @@ def parse_args(args):
         default=None,
         type=str,
         help='A string to specify a specific distributed loss implementation.'
+    )
+    
+    # 添加一个新的参数来指定 AnnData 文件的路径
+    parser.add_argument(
+        "--anndata-path",
+        type=str,
+        default=None,
+        help="Path to the master AnnData file (.h5ad) containing graph and metadata for SpaGLaM."
+    )
+    # 添加GNN相关的参数，为模型配置做准备
+    parser.add_argument(
+        "--gnn-type",
+        type=str,
+        default="gat",
+        choices=["gcn", "gat", "graphtransformer"],
+        help="Type of GNN to use in the SpaGLaM model."
     )
 
     args = parser.parse_args(args)
