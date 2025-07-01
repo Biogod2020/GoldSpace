@@ -526,6 +526,7 @@ def get_synthetic_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None
     return DataInfo(dataloader, sampler)
 
 
+# --- 修改 get_dataset_fn 函数 ---
 def get_dataset_fn(data_path, dataset_type):
     if dataset_type == "webdataset":
         return get_wds_dataset
@@ -533,10 +534,10 @@ def get_dataset_fn(data_path, dataset_type):
         return get_csv_dataset
     elif dataset_type == "synthetic":
         return get_synthetic_dataset
-    # ==================== 新增部分 ====================
+    # ==================== 新增的逻辑分支 ====================
     elif dataset_type == "spaglam":
         return get_spaglam_dataset
-    # ================================================
+    # =========================================================
     elif dataset_type == "auto":
         ext = data_path.split('.')[-1]
         if ext in ['csv', 'tsv']:
