@@ -37,6 +37,10 @@ from open_clip_train.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from open_clip_train.train import train_one_epoch, evaluate
 from open_clip_train.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 
+# --- 在文件顶部添加导入 ---
+import open_clip
+from open_clip.spaglam_model import SpaGLaM # <--- 导入我们的新模型
+
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
@@ -220,7 +224,8 @@ def main(args):
     if args.siglip:
         model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
         model_kwargs['init_logit_bias'] = -10
-    model, preprocess_train, preprocess_val = create_model_and_transforms(
+    # ————做了修改的部分————
+    omiclip_model, preprocess_train, preprocess_val = create_model_and_transforms(
         args.model,
         args.pretrained,
         precision=args.precision,
@@ -241,6 +246,18 @@ def main(args):
         cache_dir=args.cache_dir,
         **model_kwargs,
     )
+    # --- 关键逻辑：根据配置决定是否包装成SpaGLaM模型 ---
+    if args.use_spaglam_model:
+        if is_master(args):
+            logging.info("Wrapping the OmiCLIP model with the SOTA SpaGLaM architecture.")
+        
+        # 将基础模型和配置参数传递给SpaGLaM包装器
+        model = SpaGLaM(open_clip_model=omiclip_model, config=args)
+    else:
+        # 如果不使用SpaGLaM，则行为和原来一样
+        model = omiclip_model
+# ——————————————————————————————————————
+
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
@@ -266,7 +283,11 @@ def main(args):
     random_seed(args.seed, args.rank)
 
     if args.trace:
-        model = trace_model(model, batch_size=args.batch_size, device=device)
+        # 注意: tracing SpaGLaM 可能会很复杂，因为输入是图。暂时假设trace只用于标准CLIP模型。
+        if not args.use_spaglam_model:
+            model = trace_model(model, batch_size=args.batch_size, device=device)
+        else:
+            logging.warning("Tracing is not supported for SpaGLaM model at the moment. Skipping.")
 
     if args.lock_image:
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991

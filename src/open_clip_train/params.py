@@ -479,7 +479,7 @@ def parse_args(args):
         type=str,
         help='A string to specify a specific distributed loss implementation.'
     )
-    
+
     # 添加一个新的参数来指定 AnnData 文件的路径
     parser.add_argument(
         "--anndata-path",
@@ -494,6 +494,51 @@ def parse_args(args):
         default="gat",
         choices=["gcn", "gat", "graphtransformer"],
         help="Type of GNN to use in the SpaGLaM model."
+    )
+
+        # --- SpaGLaM SOTA 模型专属参数 ---
+    parser.add_argument(
+        "--use-spaglam-model",
+        action="store_true",
+        default=False,
+        help="Activate the SpaGLaM model architecture wrapper instead of standard CLIP."
+    )
+    parser.add_argument(
+        "--freeze-omiclip",
+        action="store_true",
+        default=False,
+        help="Freeze the pretrained OmiCLIP encoders during SpaGLaM training."
+    )
+    parser.add_argument(
+        "--gnn-type",
+        type=str,
+        default="gat",
+        choices=["gat", "graphtransformer"],
+        help="Type of GNN backbone to use."
+    )
+    parser.add_argument(
+        "--gnn-layers",
+        type=int,
+        default=2,
+        help="Number of layers in the GNN towers."
+    )
+    parser.add_argument(
+        "--gnn-hidden-dim",
+        type=int,
+        default=512,
+        help="Hidden dimension of the GNN layers."
+    )
+    parser.add_argument(
+        "--gnn-heads",
+        type=int,
+        default=8,
+        help="Number of attention heads for GAT or Graph Transformer."
+    )
+    parser.add_argument(
+        "--use-deep-fusion",
+        action="store_true",
+        default=False,
+        help="Enable deep modality interaction blocks between GNN layers."
     )
 
     args = parser.parse_args(args)

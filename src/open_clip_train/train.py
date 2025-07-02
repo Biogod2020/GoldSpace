@@ -89,16 +89,27 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts = batch
-        images = images.to(device=device, dtype=input_dtype, non_blocking=True)
-        texts = texts.to(device=device, non_blocking=True)
+        # --- 关键修改：数据处理分支 ---
+        if args.use_spaglam_model:
+            # 如果是SpaGLaM模式，batch是一个PyG对象，直接移动到GPU
+            batch = batch.to(device, non_blocking=True)
+            images, texts = None, None # 显式地将旧变量设为None，避免混淆
+        else:
+            images, texts = batch
+            images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+            texts = texts.to(device=device, non_blocking=True)
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
 
         if args.accum_freq == 1:
             with autocast():
-                model_out = model(images, texts)
+                # 如果是SpaGLaM模型，直接调用模型
+                if args.use_spaglam_model:
+                    model_out = model(batch)
+                else:
+                    model_out = model(images, texts)
+                # 修改结束
                 logit_scale = model_out["logit_scale"]
                 if args.distill:
                     with torch.no_grad():
@@ -111,6 +122,23 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
             backward(total_loss, scaler)
         else:
+            # --- 累积梯度部分的修改 (如果需要的话) ---
+            # 注意：累积梯度对于图模型来说逻辑更复杂，因为它不能简单地拼接特征。
+            # SOTA策略：建议在初期先将 --accum-freq 设为 1，以简化问题。
+            # 如果必须使用累积梯度，你需要累积PyG的Data对象，并在最后一步将它们
+            # collate成一个超大的Batch对象再进行一次前向和反向传播。
+            # 这里我们暂时假设 accum_freq == 1。
+            if args.accum_freq > 1:
+                # WARNING: Gradient accumulation with graph-based models is non-trivial.
+                # The logic below is for standard CLIP and WILL NOT WORK for SpaGLaM.
+                # Please set --accum-freq=1 for SpaGLaM training for now.
+                if args.use_spaglam_model:
+                    raise NotImplementedError(
+                        "Gradient accumulation is not yet supported for SpaGLaM in this script. Please use --accum-freq 1."
+                    )
+                # ... (原始的累积梯度代码) ...
+            pass # 确保这里的逻辑在accum_freq > 1时能被正确处理或跳过
+
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
@@ -256,6 +284,12 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     model.eval()
 
     zero_shot_metrics = zero_shot_eval(model, data, epoch, args, tokenizer=tokenizer)
+        # SpaGLaM 模型可能没有 'visual' 属性，或者其 'visual' 不再是标准的CLIP视觉塔
+    # 因此，我们需要有条件地运行zero-shot评估
+    if not args.use_spaglam_model:
+         zero_shot_metrics = zero_shot_eval(model, data, epoch, args, tokenizer=tokenizer)
+    else:
+         logging.info("Skipping zero-shot evaluation for SpaGLaM model.")
     metrics.update(zero_shot_metrics)
 
     autocast = get_autocast(args.precision, device_type=device.type)
@@ -271,14 +305,26 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
         cumulative_loss = 0.0
         cumulative_gen_loss = 0.0
         all_image_features, all_text_features = [], []
+        # --- 评估循环的修改 ---
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images, texts = batch
-                images = images.to(device=device, dtype=input_dtype, non_blocking=True)
-                texts = texts.to(device=device, non_blocking=True)
+                # --- 数据处理分支 ---
+                if args.use_spaglam_model:
+                    batch = batch.to(device, non_blocking=True)
+                    images, texts = None, None
+                else:
+                    images, texts = batch
+                    images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+                    texts = texts.to(device=device, non_blocking=True)
+                # --- 修改结束 ---
 
                 with autocast():
-                    model_out = model(images, texts)
+                    # --- 模型调用分支 ---
+                    if args.use_spaglam_model:
+                        model_out = model(batch)
+                    else:
+                        model_out = model(images, texts)
+                    # --- 修改结束 ---
                     image_features = model_out["image_features"]
                     text_features = model_out["text_features"]
                     logit_scale = model_out["logit_scale"]
