@@ -14,7 +14,7 @@ try:
 except ImportError:
     wandb = None
 
-from open_clip import get_input_dtype, CLIP, CustomTextCLIP
+from open_clip import get_input_dtype, CLIP, CustomTextCLIP, SpaGLaM
 from open_clip_train.distributed import is_master
 from open_clip_train.zero_shot import zero_shot_eval
 from open_clip_train.precision import get_autocast
@@ -65,6 +65,11 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     device = torch.device(args.device)
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
+
+    if args.use_spaglam_model and args.accum_freq > 1:
+        raise NotImplementedError(
+            "Gradient accumulation is not yet supported for SpaGLaM in this script. Please use --accum-freq 1."
+        )
 
     model.train()
     if args.distill:
@@ -283,14 +288,11 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     device = torch.device(args.device)
     model.eval()
 
-    zero_shot_metrics = zero_shot_eval(model, data, epoch, args, tokenizer=tokenizer)
-        # SpaGLaM 模型可能没有 'visual' 属性，或者其 'visual' 不再是标准的CLIP视觉塔
-    # 因此，我们需要有条件地运行zero-shot评估
     if not args.use_spaglam_model:
-         zero_shot_metrics = zero_shot_eval(model, data, epoch, args, tokenizer=tokenizer)
+        zero_shot_metrics = zero_shot_eval(model, data, epoch, args, tokenizer=tokenizer)
+        metrics.update(zero_shot_metrics)
     else:
-         logging.info("Skipping zero-shot evaluation for SpaGLaM model.")
-    metrics.update(zero_shot_metrics)
+        metrics["zero_shot_skipped"] = True
 
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
@@ -336,7 +338,10 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                     logits_per_image = logit_scale * image_features @ text_features.t()
                     logits_per_text = logits_per_image.t()
 
-                    batch_size = images.shape[0]
+                    if args.use_spaglam_model:
+                        batch_size = batch.num_graphs
+                    else:
+                        batch_size = images.shape[0]
                     labels = torch.arange(batch_size, device=device).long()
                     total_loss = (
                         F.cross_entropy(logits_per_image, labels) +

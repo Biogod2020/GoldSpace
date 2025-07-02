@@ -6,3 +6,4 @@ tqdm
 huggingface_hub
 safetensors
 timm
+torch_geometric

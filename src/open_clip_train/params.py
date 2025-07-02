@@ -488,13 +488,7 @@ def parse_args(args):
         help="Path to the master AnnData file (.h5ad) containing graph and metadata for SpaGLaM."
     )
     # 添加GNN相关的参数，为模型配置做准备
-    parser.add_argument(
-        "--gnn-type",
-        type=str,
-        default="gat",
-        choices=["gcn", "gat", "graphtransformer"],
-        help="Type of GNN to use in the SpaGLaM model."
-    )
+    
 
         # --- SpaGLaM SOTA 模型专属参数 ---
     parser.add_argument(

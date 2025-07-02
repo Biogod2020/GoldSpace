@@ -10,4 +10,5 @@ huggingface_hub
 safetensors
 transformers[sentencepiece]
 timm>=1.0.15
+torch_geometric
 fsspec
