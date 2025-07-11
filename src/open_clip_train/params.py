@@ -480,14 +480,14 @@ def parse_args(args):
         help='A string to specify a specific distributed loss implementation.'
     )
 
-    # 添加一个新的参数来指定 AnnData 文件的路径
-    parser.add_argument(
-        "--anndata-path",
-        type=str,
-        default=None,
-        help="Path to the master AnnData file (.h5ad) containing graph and metadata for SpaGLaM."
-    )
-    # 添加GNN相关的参数，为模型配置做准备
+#     # 添加一个新的参数来指定 AnnData 文件的路径
+#     parser.add_argument(
+#         "--anndata-path",
+#         type=str,
+#         default=None,
+#         help="Path to the master AnnData file (.h5ad) containing graph and metadata for SpaGLaM."
+#     )
+#     # 添加GNN相关的参数，为模型配置做准备
     
 
         # --- SpaGLaM SOTA 模型专属参数 ---

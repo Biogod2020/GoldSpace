@@ -98,11 +98,13 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         if args.use_spaglam_model:
             # 如果是SpaGLaM模式，batch是一个PyG对象，直接移动到GPU
             batch = batch.to(device, non_blocking=True)
-            images, texts = None, None # 显式地将旧变量设为None，避免混淆
+            images, texts = None, None # 显式地将旧变量设为None
+            batch_size = batch.num_graphs
         else:
             images, texts = batch
             images = images.to(device=device, dtype=input_dtype, non_blocking=True)
             texts = texts.to(device=device, non_blocking=True)
+            batch_size = images.shape[0]  # 使用 .shape[0] 比 len() 更稳健
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
@@ -225,7 +227,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         end = time.time()
         batch_count = i_accum + 1
         if is_master(args) and (i_accum % args.log_every_n_steps == 0 or batch_count == num_batches_per_epoch):
-            batch_size = len(images)
+            # batch_size = len(images)
             num_samples = batch_count * batch_size * args.accum_freq * args.world_size
             samples_per_epoch = dataloader.num_samples
             percent_complete = 100.0 * batch_count / num_batches_per_epoch
@@ -314,10 +316,12 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                 if args.use_spaglam_model:
                     batch = batch.to(device, non_blocking=True)
                     images, texts = None, None
+                    batch_size = batch.num_graphs  # <-- 从 PyG Batch 对象获取 batch_size
                 else:
                     images, texts = batch
                     images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                     texts = texts.to(device=device, non_blocking=True)
+                    batch_size = len(images)  # <-- 从 image tensor 获取 batch_size
                 # --- 修改结束 ---
 
                 with autocast():

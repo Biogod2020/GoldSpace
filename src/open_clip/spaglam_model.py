@@ -106,9 +106,17 @@ class SpaGLaM(nn.Module):
             self.omiclip_model.eval()
 
         # --- 获取维度信息 ---
+        # 确保即使在冻结模式下也能获取正确的维度
+        # 对于timm模型，proj可能不存在，需要更稳健的访问方式
+        if hasattr(self.omiclip_model.visual, 'proj') and self.omiclip_model.visual.proj is not None:
+             gnn_output_dim = self.omiclip_model.visual.proj.shape[1]
+        else:
+             # 如果没有proj层，输出维度就是embed_dim
+             gnn_output_dim = self.omiclip_model.visual.output_dim
+            
         gnn_input_dim = self.omiclip_model.visual.output_dim
         gnn_hidden_dim = config.gnn_hidden_dim
-        gnn_output_dim = self.omiclip_model.embed_dim
+        gnn_output_dim = self.omiclip_model.visual.proj.shape[1]
 
         # --- 构建并行的GNN塔和交互模块 ---
         self.gnn_layers_img = nn.ModuleList()

@@ -28,7 +28,7 @@ try:
 except ImportError:
     hvd = None
 
-from open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
+from open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss, SpaGLaM
 from open_clip_train.data import get_data
 from open_clip_train.distributed import is_master, init_distributed_device, broadcast_object
 from open_clip_train.logger import setup_logging
@@ -37,9 +37,6 @@ from open_clip_train.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from open_clip_train.train import train_one_epoch, evaluate
 from open_clip_train.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 
-# --- 在文件顶部添加导入 ---
-import open_clip
-from open_clip.spaglam_model import SpaGLaM # <--- 导入我们的新模型
 
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
@@ -253,6 +250,7 @@ def main(args):
         
         # 将基础模型和配置参数传递给SpaGLaM包装器
         model = SpaGLaM(open_clip_model=omiclip_model, config=args)
+        model = model.to(device)
     else:
         # 如果不使用SpaGLaM，则行为和原来一样
         model = omiclip_model

@@ -1,5 +1,10 @@
 from .version import __version__
 
+# --- 在这里或其他模型导入附近添加新行 ---
+from .spaglam_model import SpaGLaM 
+from .coca_model import CoCa
+# ------------------------------------
+
 from .coca_model import CoCa
 from .constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from .factory import create_model, create_model_and_transforms, create_model_from_pretrained, get_tokenizer, create_loss
