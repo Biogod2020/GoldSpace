@@ -93,40 +93,53 @@ class MLPProjectionHead(nn.Module):
         return self.net(x)
 
 # --- 主模型：SpaGLaM ---
+# src/open_clip/spaglam_model.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn.glob import global_mean_pool
+
+# ... (GraphTransformerLayer, DeepModalityInteractionBlock, MLPProjectionHead classes remain unchanged) ...
+
+# --- 主模型：SpaGLaM (MODIFIED) ---
 class SpaGLaM(nn.Module):
     def __init__(self, open_clip_model: nn.Module, config: object):
         super().__init__()
         self.config = config
         self.omiclip_model = open_clip_model
 
+        # --- NEW: Store the embedding mode based on the config/args ---
+        self.use_precomputed_embeddings = getattr(config, 'use_precomputed_embeddings', False)
+        
         # --- 冻结策略 ---
+        # When using precomputed embeddings, the OmiCLIP part is not used in the forward pass,
+        # so this only affects logit_scale's requires_grad status.
         if config.freeze_omiclip:
             for param in self.omiclip_model.parameters():
                 param.requires_grad = False
             self.omiclip_model.eval()
 
-        # --- 获取维度信息 ---
-        # 确保即使在冻结模式下也能获取正确的维度
-        # 对于timm模型，proj可能不存在，需要更稳健的访问方式
+        # --- 获取维度信息 (No changes here) ---
         if hasattr(self.omiclip_model.visual, 'proj') and self.omiclip_model.visual.proj is not None:
              gnn_output_dim = self.omiclip_model.visual.proj.shape[1]
         else:
-             # 如果没有proj层，输出维度就是embed_dim
              gnn_output_dim = self.omiclip_model.visual.output_dim
             
         gnn_input_dim = self.omiclip_model.visual.output_dim
         gnn_hidden_dim = config.gnn_hidden_dim
-        gnn_output_dim = self.omiclip_model.visual.proj.shape[1]
-
-        # --- 构建并行的GNN塔和交互模块 ---
+        # gnn_output_dim is determined by the final projection head, which should match the base model's projection
+        
+        # --- 构建并行的GNN塔和交互模块 (No changes here) ---
         self.gnn_layers_img = nn.ModuleList()
         self.gnn_layers_gene = nn.ModuleList()
         self.interaction_layers = nn.ModuleList() if config.use_deep_fusion else None
-
+        
         current_dim = gnn_input_dim
         for _ in range(config.gnn_layers):
             if config.gnn_type == 'gat':
-                # GATv2是比GAT更好的选择
                 self.gnn_layers_img.append(GATv2Conv(current_dim, gnn_hidden_dim, heads=config.gnn_heads, concat=False, dropout=0.1))
                 self.gnn_layers_gene.append(GATv2Conv(current_dim, gnn_hidden_dim, heads=config.gnn_heads, concat=False, dropout=0.1))
             elif config.gnn_type == 'graphtransformer':
@@ -140,7 +153,7 @@ class SpaGLaM(nn.Module):
             
             current_dim = gnn_hidden_dim
         
-        # --- 构建投影头 ---
+        # --- 构建投影头 (No changes here) ---
         self.image_proj_head = MLPProjectionHead(gnn_hidden_dim, gnn_hidden_dim, gnn_output_dim)
         self.gene_proj_head = MLPProjectionHead(gnn_hidden_dim, gnn_hidden_dim, gnn_output_dim)
 
@@ -148,16 +161,21 @@ class SpaGLaM(nn.Module):
         self.logit_scale = self.omiclip_model.logit_scale
 
     def forward(self, batch: "torch_geometric.data.Batch") -> dict:
-        # 1. 初始特征提取
-        with torch.set_grad_enabled(not self.config.freeze_omiclip):
-            # batch.x_image: (total_nodes, C, H, W), batch.x_text: (total_nodes, L)
-            E_image = self.omiclip_model.encode_image(batch.x_image)
-            E_gene = self.omiclip_model.encode_text(batch.x_text)
+        # 1. 初始特征提取 (MODIFIED: Conditional logic)
+        if self.use_precomputed_embeddings:
+            # Mode B: The dataloader provides embeddings directly.
+            E_image = batch.x_image
+            E_gene = batch.x_text
+        else:
+            # Mode A: Original behavior - encode raw data on the fly.
+            with torch.set_grad_enabled(not self.config.freeze_omiclip):
+                E_image = self.omiclip_model.encode_image(batch.x_image)
+                E_gene = self.omiclip_model.encode_text(batch.x_text)
 
+        # The rest of the forward pass is identical for both modes.
         # 2. GNN传播与深度融合
         img_feat, gene_feat = E_image, E_gene
         for i in range(self.config.gnn_layers):
-            # GNN层
             if self.config.gnn_type == 'graphtransformer':
                 img_feat = self.gnn_layers_img[i](img_feat, batch.batch)
                 gene_feat = self.gnn_layers_gene[i](gene_feat, batch.batch)
@@ -168,12 +186,10 @@ class SpaGLaM(nn.Module):
             img_feat = F.gelu(img_feat)
             gene_feat = F.gelu(gene_feat)
 
-            # 深度交互层 (如果启用)
             if self.interaction_layers is not None:
                 img_feat, gene_feat = self.interaction_layers[i](img_feat, gene_feat)
         
         # 3. 读出 (Readout)
-        # 使用全局平均池化来聚合每个子图的节点信息，得到一个代表该邻域上下文的向量
         Z_image = global_mean_pool(img_feat, batch.batch)
         Z_gene = global_mean_pool(gene_feat, batch.batch)
 

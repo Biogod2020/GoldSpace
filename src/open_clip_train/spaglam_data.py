@@ -1,6 +1,7 @@
 # ===== 文件: src/open_clip_train/spaglam_data.py (已修正) =====
 
 import logging
+import io
 import torch
 import torch.utils.data
 import webdataset as wds
@@ -66,18 +67,17 @@ def process_prepackaged_sample(sample: dict, image_processor: callable, tokenize
 
 def get_spaglam_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     """
-    为新的、高效的 SpaGLaM 数据集创建 Dataloader 的工厂函数。
+    Factory function for the pre-computed SpaGLaM dataset.
+    NOTE: `preprocess_fn` and `tokenizer` are ignored as data is already processed.
     """
     input_shards = args.train_data if is_train else args.val_data
-    assert input_shards is not None, "必须提供预打包的 WebDataset 分片路径 (--train-data / --val-data)。"
+    assert input_shards is not None, "A path to the pre-computed WebDataset shards must be provided."
     
-    bound_process_fn = lambda sample: process_prepackaged_sample(sample, preprocess_fn, tokenizer)
-
     pipeline = [
         wds.ResampledShards(input_shards),
         wds.split_by_worker,
         wds.tarfile_to_samples(handler=wds.warn_and_continue),
-        wds.map(bound_process_fn, handler=wds.warn_and_continue),
+        wds.map(process_embedding_sample, handler=wds.warn_and_continue),
         wds.select(lambda x: x is not None),
         wds.batched(args.batch_size, partial=not is_train, collation_fn=PyGBatch.from_data_list),
     ]
@@ -86,10 +86,11 @@ def get_spaglam_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     
     num_samples = args.train_num_samples if is_train else args.val_num_samples
     if is_train and num_samples:
+        # Correctly set the epoch length
         world_size = args.world_size if args.world_size > 0 else 1
         num_workers = args.workers if args.workers > 0 else 1
-        
         global_batch_size = args.batch_size * world_size
+        
         if global_batch_size > 0:
             num_batches = num_samples // global_batch_size
             if num_workers > 0:
@@ -99,7 +100,7 @@ def get_spaglam_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
 
     dataloader = wds.WebLoader(
         dataset,
-        batch_size=None,
+        batch_size=None, # Batching is done inside the pipeline
         shuffle=False,
         num_workers=args.workers,
         pin_memory=True,
@@ -109,14 +110,58 @@ def get_spaglam_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     if num_samples is not None:
         world_size = args.world_size if args.world_size > 0 else 1
         global_batch_size = args.batch_size * world_size
-        if global_batch_size > 0:
-            dataloader.num_samples = num_samples
-            dataloader.num_batches = num_samples // global_batch_size
-        else:
-            dataloader.num_samples = 0
-            dataloader.num_batches = 0
+        dataloader.num_samples = num_samples
+        dataloader.num_batches = num_samples // global_batch_size if global_batch_size > 0 else 0
     else:
         dataloader.num_samples = 0
         dataloader.num_batches = 0
 
     return DataInfo(dataloader=dataloader, shared_epoch=SharedEpoch(epoch))
+
+
+
+
+# Import from the new definitions file
+from .data_defs import DataInfo, SharedEpoch
+
+def process_embedding_sample(sample: dict) -> PyGData:
+    """
+    Processes a sample from a pre-computed embedding shard.
+    It loads serialized PyTorch tensors instead of raw images/text.
+    """
+    try:
+        # 1. Load graph structure from JSON
+        metadata = json.loads(sample['json'])
+        num_nodes = metadata['num_nodes']
+        
+        # 2. Reconstruct edge_index
+        edge_list_undirected = []
+        for u, v in metadata['edge_index']:
+            edge_list_undirected.append([u, v])
+            edge_list_undirected.append([v, u])
+        
+        edge_index = torch.tensor(
+            edge_list_undirected, dtype=torch.long
+        ).t().contiguous() if edge_list_undirected else torch.empty((2, 0), dtype=torch.long)
+            
+        # 3. Load all node embeddings from .pth files
+        image_embeddings = []
+        text_embeddings = []
+        for i in range(num_nodes):
+            img_emb = torch.load(io.BytesIO(sample[f"{i}.image.pth"]))
+            txt_emb = torch.load(io.BytesIO(sample[f"{i}.text.pth"]))
+            image_embeddings.append(img_emb)
+            text_embeddings.append(txt_emb)
+
+        # 4. Create the final PyG Data object
+        pyg_data = PyGData(
+            x_image=torch.stack(image_embeddings),
+            x_text=torch.stack(text_embeddings),
+            edge_index=edge_index,
+            num_nodes=num_nodes,
+        )
+        return pyg_data
+
+    except Exception as e:
+        logging.warning(f"Skipping corrupted embedding sample {sample.get('__key__', 'UNKNOWN_KEY')}. Error: {e}")
+        return None

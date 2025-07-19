@@ -497,6 +497,13 @@ def parse_args(args):
         default=False,
         help="Activate the SpaGLaM model architecture wrapper instead of standard CLIP."
     )
+        # ==================== NEW ARGUMENT ====================
+    parser.add_argument(
+        "--use-precomputed-embeddings",
+        action="store_true",
+        default=False,
+        help="If activated, the dataloader is expected to provide pre-computed embeddings. The SpaGLaM model will bypass its internal encoder."
+    )
     parser.add_argument(
         "--freeze-omiclip",
         action="store_true",
