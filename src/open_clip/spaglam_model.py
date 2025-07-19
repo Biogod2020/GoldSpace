@@ -160,26 +160,45 @@ class SpaGLaM(nn.Module):
         # --- 共享的 Logit Scale ---
         self.logit_scale = self.omiclip_model.logit_scale
 
-    def forward(self, batch: "torch_geometric.data.Batch") -> dict:
-        # 1. 初始特征提取 (MODIFIED: Conditional logic)
-        if self.use_precomputed_embeddings:
-            # Mode B: The dataloader provides embeddings directly.
-            E_image = batch.x_image
-            E_gene = batch.x_text
+    # ==================== 核心修改点 ====================
+    def forward(self, batch: "torch_geometric.data.Batch", use_encoder: Optional[bool] = None) -> dict:
+        """
+        SpaGLaM 的前向传播。
+
+        Args:
+            batch (torch_geometric.data.Batch): 输入的图批次数据。
+            use_encoder (Optional[bool]): 动态控制是否使用内部编码器。
+                - 如果为 True, 强制使用 OmiCLIP 编码器处理原始数据 (用于推理)。
+                - 如果为 False, 强制跳过编码器，直接使用 batch 中的 embeddings (用于预计算模式的训练)。
+                - 如果为 None (默认), 则根据模型初始化时的配置决定。
+        """
+        # 决定当前前向传播的模式
+        # 优先级: 方法的显式参数 > 模型初始化时的配置
+        if use_encoder is None:
+            # 训练时，此参数为 None，行为由 `use_precomputed_embeddings_on_init` 决定
+            should_encode = not self.use_precomputed_embeddings_on_init
         else:
-            # Mode A: Original behavior - encode raw data on the fly.
-            with torch.set_grad_enabled(not self.config.freeze_omiclip):
+            # 推理时，可以显式覆盖
+            should_encode = use_encoder
+
+        # 1. 初始特征提取 (根据模式选择)
+        if should_encode:
+            # 模式 A: 实时编码原始数据 (用于推理或原始数据训练)
+            with torch.set_grad_enabled(not self.config.freeze_omiclip and self.training):
                 E_image = self.omiclip_model.encode_image(batch.x_image)
                 E_gene = self.omiclip_model.encode_text(batch.x_text)
+        else:
+            # 模式 B: 直接使用预计算的 embeddings (用于高效训练)
+            E_image = batch.x_image
+            E_gene = batch.x_text
 
-        # The rest of the forward pass is identical for both modes.
-        # 2. GNN传播与深度融合
+        # 2. GNN传播与深度融合 (后续逻辑完全不变)
         img_feat, gene_feat = E_image, E_gene
         for i in range(self.config.gnn_layers):
             if self.config.gnn_type == 'graphtransformer':
                 img_feat = self.gnn_layers_img[i](img_feat, batch.batch)
                 gene_feat = self.gnn_layers_gene[i](gene_feat, batch.batch)
-            else: # GAT
+            else:
                 img_feat = self.gnn_layers_img[i](img_feat, batch.edge_index)
                 gene_feat = self.gnn_layers_gene[i](gene_feat, batch.edge_index)
             
@@ -197,9 +216,10 @@ class SpaGLaM(nn.Module):
         final_image_features = self.image_proj_head(Z_image)
         final_text_features = self.gene_proj_head(Z_gene)
 
-        # 5. 返回与open-clip损失函数兼容的字典
+        # 5. 返回
         return {
             "image_features": F.normalize(final_image_features, dim=-1),
             "text_features": F.normalize(final_text_features, dim=-1),
             "logit_scale": self.logit_scale.exp(),
         }
+    # ==================== 修改结束 ====================
