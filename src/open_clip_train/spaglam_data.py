@@ -124,6 +124,7 @@ def get_spaglam_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
 # Import from the new definitions file
 from .data_defs import DataInfo, SharedEpoch
 
+
 def process_embedding_sample(sample: dict) -> PyGData:
     """
     Processes a sample from a pre-computed embedding shard.
@@ -144,19 +145,19 @@ def process_embedding_sample(sample: dict) -> PyGData:
             edge_list_undirected, dtype=torch.long
         ).t().contiguous() if edge_list_undirected else torch.empty((2, 0), dtype=torch.long)
             
-        # 3. Load all node embeddings from .pth files
-        image_embeddings = []
-        text_embeddings = []
-        for i in range(num_nodes):
-            img_emb = torch.load(io.BytesIO(sample[f"{i}.image.pth"]))
-            txt_emb = torch.load(io.BytesIO(sample[f"{i}.text.pth"]))
-            image_embeddings.append(img_emb)
-            text_embeddings.append(txt_emb)
+        # ===== SOTA MODIFICATION START =====
+        # Load all embeddings from a single .pth file with one torch.load call.
+        # This avoids the massive I/O overhead of loading each node's embedding separately.
+        
+        embeddings_dict = torch.load(io.BytesIO(sample["embeddings.pth"]))
+        image_embeddings = embeddings_dict['image']
+        text_embeddings = embeddings_dict['text']
+        # ===== SOTA MODIFICATION END =====
 
         # 4. Create the final PyG Data object
         pyg_data = PyGData(
-            x_image=torch.stack(image_embeddings),
-            x_text=torch.stack(text_embeddings),
+            x_image=image_embeddings,
+            x_text=text_embeddings,
             edge_index=edge_index,
             num_nodes=num_nodes,
         )

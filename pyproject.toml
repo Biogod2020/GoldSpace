@@ -1,80 +1,39 @@
+# pyproject.toml
+
 [build-system]
-requires = ["pdm-backend"]
-build-backend = "pdm.backend"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "open_clip_torch"
-# NOTE for full list of authors see https://github.com/mlfoundations/open_clip?tab=readme-ov-file#citing
-# below covers most active / recent maintainers
+name = "GoldSpace"
+version = "0.1.0"
 authors = [
-    {name = "Ross Wightman", email = "ross@huggingface.co"},
-    {name = "Gabriel Ilharco"},
-    {name = "Mitchell Wortsman"},
-    {name = "Romain Beaumont"},
+  { name="jijh", email="your.email@example.com" },
 ]
-description = "Open reproduction of consastive language-image pretraining (CLIP) and related."
+description = "A research project for SpaGLaM, including open_clip_training and a dedicated preprocessing pipeline."
 readme = "README.md"
-requires-python = ">=3.8"
-keywords = ["pytorch", "clip", "image-text", "language-image", "multimodal"]
-license = {text = "MIT"}
+requires-python = ">=3.9"
 classifiers = [
-        'Development Status :: 4 - Beta',
-        'Intended Audience :: Education',
-        'Intended Audience :: Science/Research',
-        'License :: OSI Approved :: MIT License',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
-        'Programming Language :: Python :: 3.11',
-        'Programming Language :: Python :: 3.12',
-        'Topic :: Scientific/Engineering',
-        'Topic :: Scientific/Engineering :: Artificial Intelligence',
-        'Topic :: Software Development',
-        'Topic :: Software Development :: Libraries',
-        'Topic :: Software Development :: Libraries :: Python Modules',
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
 ]
-dependencies = [
-    'torch>=1.9.0',
-    'torchvision',
-    'regex',
-    'ftfy',
-    'tqdm',
-    'huggingface-hub',
-    'safetensors',
-    'timm',
-]
-dynamic = ["version"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.optional-dependencies]
-training = [
-    'torch>=2.0',
-    'webdataset>=0.2.5,<=0.2.86',
-    'pandas',
-    'transformers[sentencepiece]',
-    'timm>=1.0.10',
-    'fsspec',
-]
-test = [
-    'pytest-split',
-    'pytest',
-    'open_clip_torch[training]'
+# Dependencies for the SpaGLaM preprocessing package
+preproc_models = ["open-clip-torch"]
+preproc_wsi = ["openslide-python"]
+preproc_squidpy = ["squidpy"]
+preproc_notebook = ["matplotlib", "ipython", "jupyter"]
+preproc_all = [
+    "spaglam-preproc[preproc_models]",
+    "spaglam-preproc[preproc_wsi]",
+    "spaglam-preproc[preproc_squidpy]",
+    "spaglam-preproc[preproc_notebook]",
 ]
 
-[project.urls]
-homepage = "https://github.com/mlfoundations/open_clip"
-repository = "https://github.com/mlfoundations/open_clip"
-
-[tool.pdm.version]
-source = "file"
-path = "src/open_clip/version.py"
-
-[tool.pdm.build]
-excludes = ["./**/.git", "./**/logs/*"]
-package-dir = "src"
-includes = ["src/open_clip", "src/open_clip_train"]
-
-[tool.pytest.ini_options]
-testpaths = ['tests']
-markers = [
-    'regression_test'
-]
+[project.scripts]
+spaglam-preproc = "spaglam_preproc.cli:app"
