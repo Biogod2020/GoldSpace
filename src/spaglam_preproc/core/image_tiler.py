@@ -34,16 +34,15 @@ class ImageHandler:
     def _load_image(self, source, adata):
         """Internal method to load the image from the specified source."""
         # 1. Try to load from AnnData object if it's the primary source
-        if source is None and adata is not None and ImageContainer is not None:
+        if source is None and adata is not None:
             spatial_key = list(adata.uns.get('spatial', {}).keys())
             if spatial_key:
                 # Assuming standard squidpy storage format
                 img_container = adata.uns['spatial'][spatial_key[0]]['images'].get('hires')
-                if isinstance(img_container, ImageContainer):
-                    self.image_obj = img_container
-                    self.width, self.height = self.image_obj.shape[1], self.image_obj.shape[0]
-                    logging.info(f"Loaded image '{spatial_key[0]}' from AnnData object.")
-                    return
+                self.image_obj = img_container
+                self.width, self.height = self.image_obj.shape[1], self.image_obj.shape[0]
+                logging.info(f"Loaded image '{spatial_key[0]}' from AnnData object.")
+                return
             else:
                  raise ValueError("Image source is None and no spatial image found in adata.uns['spatial'].")
         
