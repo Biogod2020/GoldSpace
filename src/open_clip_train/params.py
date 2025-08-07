@@ -541,6 +541,12 @@ def parse_args(args):
         default=False,
         help="Enable deep modality interaction blocks between GNN layers."
     )
+    parser.add_argument(
+        "--use-residual-connection",
+        action="store_true",
+        default=False,
+        help="Enable residual connections around GNN layers."
+    )
 
     args = parser.parse_args(args)
 
