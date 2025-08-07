@@ -1,0 +1,1034 @@
+# ==============================================================================
+# ========================      CONFIGURATION       ==========================
+# ==============================================================================
+import os
+import io
+import json
+import logging
+import time
+import pandas as pd
+import scanpy as sc
+import webdataset as wds
+import torch
+from PIL import Image
+from tqdm.auto import tqdm # Use notebook-friendly tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from collections import deque
+from scipy.sparse import csr_matrix
+
+# --- 关键路径设置 ---
+# AnnData文件路径
+ADATA_PATH = "/cwStorage/nodecw_group/jijh/spaglam_sota_data/master_adata_with_graph_and_paths.h5ad"
+# 原始数据（瓦片和句子）的根目录
+TILES_BASE_DIR = "/cwStorage/nodecw_group/jijh/hest_output"
+SENTENCES_BASE_DIR = "/cwStorage/nodecw_group/jijh/hest_sentences_human_all"
+# 最终输出的 WebDataset Shards 目录
+OUTPUT_DIR = "/cwStorage/nodecw_group/jijh/spaglam_embedding_shards_2hops"
+
+# --- OmiCLIP 模型设置 ---
+BASE_MODEL_PATH = "/cwStorage/nodecw_group/jijh/training_log/cfff_train/openclip_train/train_log/finetune_20250623-092915/2025_06_23-09_30_48-model_ViT-B-32-lr_2e-05-b_1800-j_16-p_amp_bfloat16/checkpoints/epoch_25.pt"
+MODEL_NAME = "ViT-B-32"
+
+# --- 性能与流程控制 ---
+K_HOPS = 2  # <-- 在这里设置你想要的跳数 (e.g., 2)
+MAX_SAMPLES_PER_SHARD = 10000
+MAX_CPU_WORKERS = 128  # 用于I/O的CPU线程数
+GPU_BATCH_SIZE = 1024 # 用于embedding计算的GPU批次大小
+
+# --- 日志设置 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+# --- 确保 open_clip 可导入 ---
+try:
+    import open_clip
+except ImportError:
+    raise ImportError("open_clip library not found. Please install or set PYTHONPATH.")
+# ==============================================================================
+# ========================       UTILITY FUNCTIONS       =======================
+# ==============================================================================
+
+def get_k_hop_neighborhood(adjacency_matrix: csr_matrix, start_node_idx: int, k: int) -> list[int]:
+    """高效的BFS函数，用于查找k-hop邻域"""
+    if k == 0: return [start_node_idx]
+    visited = {start_node_idx}
+    queue = deque([(start_node_idx, 0)])
+    neighborhood = [start_node_idx]
+    while queue:
+        current_node, level = queue.popleft()
+        if level >= k: continue
+        start_ptr, end_ptr = adjacency_matrix.indptr[current_node], adjacency_matrix.indptr[current_node + 1]
+        neighbors = adjacency_matrix.indices[start_ptr:end_ptr]
+        for neighbor in neighbors:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                neighborhood.append(neighbor)
+                queue.append((neighbor, level + 1))
+    return neighborhood
+
+def _load_raw_node_data_worker(spot_id, adata, tiles_base_dir, sentences_base_dir):
+    """阶段一的worker：为单个spot加载原始数据"""
+    try:
+        spot_metadata = adata.obs.loc[spot_id]
+        sample_id = spot_metadata['sample_id']
+        
+        if pd.isna(spot_metadata['pxl_row_in_fullres']) or pd.isna(spot_metadata['pxl_col_in_fullres']):
+            spot_adata_index = adata.obs_names.get_loc(spot_id)
+            filename_suffix = f"{spot_adata_index}_0_no_coord"
+        else:
+            row_coord = int(round(spot_metadata['pxl_row_in_fullres']))
+            col_coord = int(round(spot_metadata['pxl_col_in_fullres']))
+            filename_suffix = f"{row_coord}_{col_coord}"
+            
+        tile_path = os.path.join(tiles_base_dir, f"{sample_id}_tiles", f"{sample_id}_{filename_suffix}.png")
+        sentence_path = os.path.join(sentences_base_dir, f"{sample_id}_sentences_hvg", f"{sample_id}_{filename_suffix}.txt")
+
+        with open(tile_path, 'rb') as f_img:
+            tile_image = Image.open(f_img).convert("RGB")
+        with open(sentence_path, 'r', encoding='utf-8') as f_txt:
+            sentence_text = f_txt.read()
+            
+        return spot_id, {"tile": tile_image, "sentence": sentence_text}
+    except Exception as e:
+        return spot_id, e
+# ==============================================================================
+# ========================   LOAD MASTER AnnData     =========================
+# ==============================================================================
+logging.info(f"💾 Loading AnnData: {ADATA_PATH}")
+adata = sc.read_h5ad(ADATA_PATH)
+adj_matrix = adata.obsp['spatial_connectivities'].tocsr()
+logging.info(f"✅ AnnData loaded. Total spots: {adata.n_obs}")
+# ==============================================================================
+# ========================   PHASE 1: RAW DATA CACHING   =======================
+# ==============================================================================
+logging.info(f"🔥 Phase 1: Caching raw data for all {adata.n_obs} spots to memory...")
+start_time_phase1 = time.time()
+raw_data_cache = {}
+error_count_phase1 = 0
+
+with ThreadPoolExecutor(max_workers=MAX_CPU_WORKERS) as executor:
+    future_to_spot = {
+        executor.submit(_load_raw_node_data_worker, spot_id, adata, TILES_BASE_DIR, SENTENCES_BASE_DIR): spot_id
+        for spot_id in adata.obs.index
+    }
+    pbar = tqdm(as_completed(future_to_spot), total=len(future_to_spot), desc="Caching Raw Data")
+    for future in pbar:
+        spot_id, result = future.result()
+        if isinstance(result, dict):
+            raw_data_cache[spot_id] = result
+        else:
+            logging.debug(f"Cache loading failed for '{spot_id}': {result}")
+            error_count_phase1 += 1
+
+logging.info(f"✅ Phase 1 finished in {time.time() - start_time_phase1:.2f}s. "
+             f"Loaded: {len(raw_data_cache)} spots. Failed: {error_count_phase1}.")
+model = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=BASE_MODEL_PATH)
+model
+# ==============================================================================
+# ============   PHASE 2 (V3.2): EFFICIENT MULTI-GPU EMBEDDING (SAFE TEST)   ====
+# ==============================================================================
+import torch
+import open_clip
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm.auto import tqdm
+import gc
+import pandas as pd
+
+# --- 配置 ---
+# 使用你环境中所有可用的GPU
+AVAILABLE_DEVICES = ["cuda:0", "cuda:1", "cuda:2"]
+# 测试时使用较小的批次大小，以便快速看到结果
+GPU_BATCH_SIZE_TEST = 128
+# 从你已有的缓存中取一小部分数据进行测试
+NUM_SAMPLES_TO_TEST = 1000  # 使用1000个样本进行测试
+
+# --- 持久化Worker类 ---
+class EmbeddingWorker:
+    def __init__(self, device_id, model_name, base_model_path):
+        """
+        初始化Worker，加载模型一次。
+        """
+        self.device = torch.device(device_id)
+        # 加载模型和预处理器
+        self.model, _, self.image_preprocessor = open_clip.create_model_and_transforms(
+            model_name, pretrained=base_model_path, device=self.device
+        )
+        self.model.eval()
+        self.tokenizer = open_clip.get_tokenizer(model_name)
+        logging.info(f"Worker initialized on {self.device} and model loaded.")
+
+    def process_batch(self, batch_data):
+        """
+        处理一个批次的数据，使用已经加载好的模型。
+        """
+        batch_ids, batch_tiles, batch_sentences = batch_data
+        
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            image_input = torch.stack(
+                [self.image_preprocessor(img) for img in batch_tiles]
+            ).to(self.device)
+            text_input = self.tokenizer(batch_sentences).to(self.device)
+            
+            image_embeds = self.model.encode_image(image_input, normalize=True).cpu()
+            text_embeds = self.model.encode_text(text_input, normalize=True).cpu()
+            
+        return batch_ids, image_embeds, text_embeds
+
+# --- 主逻辑 ---
+logging.info("🔥 Phase 2 (Safe Test): Starting efficient Multi-GPU Pre-computation...")
+start_time_phase2 = time.time()
+
+# 1. 准备一小部分测试数据
+# 确保 raw_data_cache 存在于你的 notebook 环境中
+if 'raw_data_cache' not in locals() or not raw_data_cache:
+    raise NameError("`raw_data_cache` not found. Please run Phase 1 (raw data caching) first.")
+
+test_spot_ids = list(raw_data_cache.keys())[:NUM_SAMPLES_TO_TEST]
+test_data_to_process = [
+    (
+        test_spot_ids[i:i+GPU_BATCH_SIZE_TEST], 
+        [raw_data_cache[sid]['tile'] for sid in test_spot_ids[i:i+GPU_BATCH_SIZE_TEST]],
+        [raw_data_cache[sid]['sentence'] for sid in test_spot_ids[i:i+GPU_BATCH_SIZE_TEST]]
+    )
+    for i in range(0, len(test_spot_ids), GPU_BATCH_SIZE_TEST)
+]
+logging.info(f"Prepared {len(test_data_to_process)} batches for {len(test_spot_ids)} test samples.")
+
+# 创建一个临时的测试缓存，不修改原始的 raw_data_cache
+test_embedding_cache = {}
+
+# 2. 创建持久化的Worker实例
+workers = [
+    EmbeddingWorker(device_id, MODEL_NAME, BASE_MODEL_PATH)
+    for device_id in AVAILABLE_DEVICES
+]
+
+# 3. 使用ThreadPoolExecutor运行
+with ThreadPoolExecutor(max_workers=len(AVAILABLE_DEVICES)) as executor:
+    futures = []
+    # 轮询地将任务分配给不同的worker实例
+    for i, batch in enumerate(test_data_to_process):
+        worker = workers[i % len(workers)]
+        # 提交任务到worker的process_batch方法
+        future = executor.submit(worker.process_batch, batch)
+        futures.append(future)
+    
+    # 4. 收集结果
+    pbar = tqdm(as_completed(futures), total=len(futures), desc="Encoding Test Batches")
+    for future in pbar:
+        batch_ids, image_embeds, text_embeds = future.result()
+        for i, spot_id in enumerate(batch_ids):
+            test_embedding_cache[spot_id] = {
+                "image_embed": image_embeds[i], 
+                "text_embed": text_embeds[i]
+            }
+
+# --- 5. 验证和清理 ---
+logging.info(f"✅ Phase 2 (Safe Test) finished in {time.time() - start_time_phase2:.2f}s.")
+logging.info(f"Computed embeddings for {len(test_embedding_cache)} spots.")
+
+# 验证一下结果
+first_key = list(test_embedding_cache.keys())[0]
+first_embed = test_embedding_cache[first_key]['image_embed']
+print(f"Sample verification: First embedding for spot '{first_key}' has shape: {first_embed.shape}")
+assert first_embed.shape[0] == 512 # Assuming ViT-B-32
+
+del workers # 显式删除worker实例以释放GPU内存
+torch.cuda.empty_cache()
+gc.collect()
+
+print("\n🎉 Small-scale test successful! You can now adapt this pattern for the full dataset.")
+# ==============================================================================
+# ======   PHASE 2 (V3.3): FULL DATA, MULTI-GPU EMBEDDING PRE-COMPUTATION   ======
+# ==============================================================================
+import torch
+import open_clip
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm.auto import tqdm
+import gc
+import logging
+
+# --- 配置 (从你的Notebook前置单元格继承) ---
+# AVAILABLE_DEVICES, MODEL_NAME, BASE_MODEL_PATH 应该已经定义好
+GPU_BATCH_SIZE = 512  # 为完整数据运行设置一个较大的批次大小以提高效率
+
+# --- 持久化Worker类 (与测试版相同) ---
+class EmbeddingWorker:
+    """
+    一个持久化的Worker，在初始化时加载一次模型到指定的GPU。
+    """
+    def __init__(self, device_id, model_name, base_model_path):
+        self.device = torch.device(device_id)
+        # 加载模型和预处理器
+        self.model, _, self.image_preprocessor = open_clip.create_model_and_transforms(
+            model_name, pretrained=base_model_path, device=self.device
+        )
+        self.model.eval()
+        self.tokenizer = open_clip.get_tokenizer(model_name)
+        # 在创建时打印日志，以便确认每个worker都已启动
+        logging.info(f"Worker initialized on {self.device} and model loaded into VRAM.")
+
+    def process_batch(self, batch_data):
+        """
+        使用预加载的模型处理一个批次的数据。
+        """
+        batch_ids, batch_tiles, batch_sentences = batch_data
+        
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            image_input = torch.stack(
+                [self.image_preprocessor(img) for img in batch_tiles]
+            ).to(self.device)
+            text_input = self.tokenizer(batch_sentences).to(self.device)
+            
+            image_embeds = self.model.encode_image(image_input, normalize=True).cpu()
+            text_embeds = self.model.encode_text(text_input, normalize=True).cpu()
+            
+        return batch_ids, image_embeds, text_embeds
+
+# --- 主逻辑 ---
+logging.info("🔥 Phase 2: Starting FULL DATA Multi-GPU Pre-computation...")
+start_time_phase2 = time.time()
+
+# 1. 验证 raw_data_cache 是否存在
+if 'raw_data_cache' not in locals() or not raw_data_cache:
+    raise NameError("`raw_data_cache` not found. Please run Phase 1 (raw data caching) first.")
+
+# 2. 准备所有待处理的数据批次
+cached_spot_ids = list(raw_data_cache.keys())
+data_to_process = [
+    (
+        cached_spot_ids[i:i+GPU_BATCH_SIZE], 
+        [raw_data_cache[sid]['tile'] for sid in cached_spot_ids[i:i+GPU_BATCH_SIZE]],
+        [raw_data_cache[sid]['sentence'] for sid in cached_spot_ids[i:i+GPU_BATCH_SIZE]]
+    )
+    for i in range(0, len(cached_spot_ids), GPU_BATCH_SIZE)
+]
+logging.info(f"Prepared {len(data_to_process)} batches for all {len(cached_spot_ids)} cached spots.")
+
+# 3. 创建一个新的、独立的 embedding_cache
+embedding_cache = {}
+
+# 4. 创建持久化的Worker实例
+logging.info(f"Creating {len(AVAILABLE_DEVICES)} persistent workers...")
+workers = [
+    EmbeddingWorker(device_id, MODEL_NAME, BASE_MODEL_PATH)
+    for device_id in AVAILABLE_DEVICES
+]
+logging.info("All workers created and models loaded.")
+
+# 5. 使用ThreadPoolExecutor运行并行推理
+with ThreadPoolExecutor(max_workers=len(AVAILABLE_DEVICES)) as executor:
+    futures = []
+    # 轮询地将任务分配给不同的worker实例
+    for i, batch in enumerate(data_to_process):
+        worker = workers[i % len(workers)]
+        future = executor.submit(worker.process_batch, batch)
+        futures.append(future)
+    
+    # 6. 收集结果并填充新的embedding_cache
+    pbar = tqdm(as_completed(futures), total=len(futures), desc="Encoding All Batches on Multi-GPU")
+    for future in pbar:
+        try:
+            batch_ids, image_embeds, text_embeds = future.result()
+            for i, spot_id in enumerate(batch_ids):
+                embedding_cache[spot_id] = {
+                    "image_embed": image_embeds[i], 
+                    "text_embed": text_embeds[i]
+                }
+        except Exception as e:
+            logging.error(f"A batch failed during processing: {e}")
+
+
+# --- 7. 验证和清理 ---
+logging.info(f"✅ Phase 2 finished in {time.time() - start_time_phase2:.2f}s.")
+logging.info(f"Computed embeddings for {len(embedding_cache)} spots.")
+
+
+# 验证一下结果
+if embedding_cache:
+    first_key = list(embedding_cache.keys())[0]
+    first_embed = embedding_cache[first_key]['image_embed']
+    print(f"Sample verification: First embedding for spot '{first_key}' has shape: {first_embed.shape}")
+    assert first_embed.shape[0] == 512 # Assuming ViT-B-32 for OmiCLIP
+else:
+    logging.warning("Warning: Embedding cache is empty after processing. Check for errors.")
+
+# 显式地删除worker实例以释放GPU内存，这是在notebook中非常好的习惯
+del workers
+torch.cuda.empty_cache()
+gc.collect()
+logging.info("GPU resources released.")
+
+print("\n🎉 Full data pre-computation successful!")
+print("The `embedding_cache` dictionary is now ready for Phase 3 (Subgraph Assembly).")
+print("The original `raw_data_cache` remains untouched.")
+OUTPUT_DIR
+# ==============================================================================
+# =================   PHASE 3: SUBGRAPH ASSEMBLY & SHARDING   ==================
+# ==============================================================================
+
+# 导入必要的库 (如果这是一个新的会话，请确保重新导入)
+import os
+import io
+import json
+import logging
+import time
+import webdataset as wds
+import torch
+from tqdm.auto import tqdm
+from collections import deque
+from scipy.sparse import csr_matrix
+
+# --- 确认必要的变量存在 ---
+if 'adata' not in locals() or 'adj_matrix' not in locals():
+    raise NameError("`adata` or `adj_matrix` not found. Please load them first.")
+if 'embedding_cache' not in locals() or not embedding_cache:
+    raise NameError("`embedding_cache` is empty or not found. Please run Phase 2 first.")
+if 'K_HOPS' not in locals() or 'OUTPUT_DIR' not in locals() or 'MAX_SAMPLES_PER_SHARD' not in locals():
+     raise NameError("Configuration variables like K_HOPS, OUTPUT_DIR are missing.")
+
+# --- 工具函数 (如果需要，可以从前面的单元格复制过来) ---
+def get_k_hop_neighborhood(adjacency_matrix: csr_matrix, start_node_idx: int, k: int) -> list[int]:
+    """高效的BFS函数，用于查找k-hop邻域"""
+    if k == 0: return [start_node_idx]
+    visited = {start_node_idx}
+    queue = deque([(start_node_idx, 0)])
+    neighborhood = [start_node_idx]
+    while queue:
+        current_node, level = queue.popleft()
+        if level >= k: continue
+        start_ptr, end_ptr = adjacency_matrix.indptr[current_node], adjacency_matrix.indptr[current_node + 1]
+        neighbors = adjacency_matrix.indices[start_ptr:end_ptr]
+        for neighbor in neighbors:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                neighborhood.append(neighbor)
+                queue.append((neighbor, level + 1))
+    return neighborhood
+
+# --- 主逻辑 ---
+logging.info(f"✍️  Phase 3: Assembling {K_HOPS}-hop subgraphs from cached embeddings...")
+start_time_phase3 = time.time()
+
+# 确保输出目录存在
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+# 为输出文件名添加标识，表明它包含的是embeddings
+shards_pattern = os.path.join(OUTPUT_DIR, f"shard_k{K_HOPS}_embeds-%06d.tar")
+success_count = 0
+error_count_phase3 = 0
+
+with wds.ShardWriter(shards_pattern, maxcount=MAX_SAMPLES_PER_SHARD) as sink:
+    # 遍历所有spot作为中心点来构建子图
+    pbar = tqdm(adata.obs.index, desc=f"Assembling {K_HOPS}-hop Subgraphs", unit="spot")
+    for center_spot_id in pbar:
+        try:
+            center_idx_global = adata.obs.names.get_loc(center_spot_id)
+            
+            # 1. 使用高效的BFS获取k-hop邻域的全局索引
+            all_global_indices = get_k_hop_neighborhood(adj_matrix, center_idx_global, k=K_HOPS)
+            all_spot_ids = adata.obs.names[all_global_indices].tolist()
+            
+            # 2. 检查该子图的所有节点是否都有预计算好的embedding
+            if not all(sid in embedding_cache for sid in all_spot_ids):
+                # 如果有任何一个节点的embedding缺失，则跳过这个子图
+                raise KeyError(f"One or more nodes for subgraph '{center_spot_id}' are missing from the embedding cache.")
+
+            # 3. 构建局部图结构 (edge_index)
+            global_id_to_local_idx = {sid: i for i, sid in enumerate(all_spot_ids)}
+            edge_list = []
+            for u_local_idx, u_global_idx in enumerate(all_global_indices):
+                start, end = adj_matrix.indptr[u_global_idx], adj_matrix.indptr[u_global_idx + 1]
+                for v_global_idx in adj_matrix.indices[start:end]:
+                    if v_global_idx in global_id_to_local_idx:
+                        v_local_idx = global_id_to_local_idx[v_global_idx]
+                        if u_local_idx < v_local_idx:
+                            edge_list.append([u_local_idx, v_local_idx])
+            
+            # 4. 从缓存中提取embeddings并打包
+            image_embeddings = torch.stack([embedding_cache[sid]['image_embed'] for sid in all_spot_ids])
+            text_embeddings = torch.stack([embedding_cache[sid]['text_embed'] for sid in all_spot_ids])
+            
+            # SOTA优化：将所有embeddings打包到一个文件中
+            embeddings_dict = {'image': image_embeddings, 'text': text_embeddings}
+            emb_buffer = io.BytesIO()
+            torch.save(embeddings_dict, emb_buffer)
+            
+            # 5. 组装最终的样本字典
+            sample = {
+                "__key__": center_spot_id,
+                "json": json.dumps({"num_nodes": len(all_spot_ids), "edge_index": edge_list}).encode('utf-8'),
+                "embeddings.pth": emb_buffer.getvalue()
+            }
+            
+            # 6. 写入到.tar分片文件
+            sink.write(sample)
+            success_count += 1
+
+        except Exception as e:
+            logging.debug(f"Subgraph assembly failed for '{center_spot_id}': {e}")
+            error_count_phase3 += 1
+            
+logging.info(f"✅ Phase 3 finished in {time.time() - start_time_phase3:.2f}s.")
+logging.info("\n" + "="*80)
+logging.info(f"🏁 Final Pipeline Complete! Output for K={K_HOPS} is in: {OUTPUT_DIR}")
+logging.info(f"  - Successfully Packaged: {success_count} subgraphs")
+logging.info(f"  - Assembly Errors: {error_count_phase3}")
+logging.info(f"  - Total Time (since Phase 1 start): {(time.time() - start_time_phase1) / 60:.2f} minutes")
+logging.info("="*80)
+# ==============================================================================
+# ======   PHASE 3: SUBGRAPH ASSEMBLY & EFFICIENT WEBDATASET WRITING   =======
+# ==============================================================================
+
+def assemble_and_write_shards(adata, adj_matrix, embedding_cache, output_dir, k_hops, max_samples_per_shard, max_workers):
+    """
+    Assembles subgraphs using pre-computed embeddings and writes them to WebDataset shards.
+    This is the final step of the preprocessing pipeline.
+    """
+    logging.info(f"🔥 Phase 3: Assembling subgraphs and writing to WebDataset shards...")
+    start_time_phase3 = time.time()
+    
+    # 1. Setup output directory and shard writer
+    os.makedirs(output_dir, exist_ok=True)
+    shards_pattern = os.path.join(output_dir, "shard-%06d.tar")
+    
+    # 2. Define the worker function for parallel processing
+    def _assemble_subgraph_worker(center_spot_id: str):
+        """
+        Worker function for a single center spot. It performs graph building and
+        embedding assembly in memory and returns a sample dict for the shard writer.
+        """
+        try:
+            # a. Get k-hop neighborhood using the pre-loaded adjacency matrix
+            center_node_idx = adata.obs_names.get_loc(center_spot_id)
+            global_indices = get_k_hop_neighborhood(adj_matrix, center_node_idx, k_hops)
+            all_spot_ids = adata.obs_names[global_indices].tolist()
+            
+            # b. Build local graph structure
+            global_id_to_local_idx = {sid: i for i, sid in enumerate(all_spot_ids)}
+            local_edge_index = []
+            for local_u_idx, u_id in enumerate(all_spot_ids):
+                u_global_idx = adata.obs_names.get_loc(u_id)
+                start, end = adj_matrix.indptr[u_global_idx], adj_matrix.indptr[u_global_idx + 1]
+                for v_global_idx in adj_matrix.indices[start:end]:
+                    v_id = adata.obs_names[v_global_idx]
+                    if v_id in global_id_to_local_idx:
+                        local_v_idx = global_id_to_local_idx[v_id]
+                        if local_u_idx < local_v_idx:
+                            local_edge_index.append([local_u_idx, local_v_idx])
+            
+            # c. Collect pre-computed embeddings from the cache
+            # This is extremely fast as it's just a dictionary lookup
+            img_embeds = [embedding_cache[sid]['image_embed'] for sid in all_spot_ids]
+            txt_embeds = [embedding_cache[sid]['text_embed'] for sid in all_spot_ids]
+            
+            # d. Package into the SOTA format: one .pth file per sample
+            embeddings_dict = {
+                'image': torch.stack(img_embeds),  # Shape: [num_nodes, embed_dim]
+                'text': torch.stack(txt_embeds)    # Shape: [num_nodes, embed_dim]
+            }
+            emb_buf = io.BytesIO()
+            torch.save(embeddings_dict, emb_buf)
+            
+            # e. Assemble the final sample for webdataset
+            sample = {
+                "__key__": center_spot_id,
+                "json": json.dumps({"num_nodes": len(all_spot_ids), "edge_index": local_edge_index}).encode('utf-8'),
+                "embeddings.pth": emb_buf.getvalue()
+            }
+            return sample, None
+        
+        except Exception as e:
+            return None, f"Spot '{center_spot_id}' failed with {type(e).__name__}: {e}"
+
+    # 3. Main parallel processing loop
+    success_count = 0
+    error_count = 0
+    with wds.ShardWriter(shards_pattern, maxcount=max_samples_per_shard) as sink:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all spots for processing
+            future_to_spot = {
+                executor.submit(_assemble_subgraph_worker, spot_id): spot_id 
+                for spot_id in adata.obs.index
+            }
+            
+            pbar = tqdm(as_completed(future_to_spot), total=len(future_to_spot), desc="Assembling & Writing Shards")
+            for future in pbar:
+                sample, error_msg = future.result()
+                if sample:
+                    sink.write(sample)
+                    success_count += 1
+                else:
+                    error_count += 1
+                    logging.debug(error_msg) # Log errors for failed spots
+
+    # 4. Final summary
+    logging.info(f"✅ Phase 3 finished in {(time.time() - start_time_phase3) / 60:.2f} minutes.")
+    logging.info(f"Successfully created {success_count} samples. Failed: {error_count}.")
+    logging.info(f"Find your final embedding shards at: {output_dir}")
+
+# --- Execute Phase 3 using the variables from your previous cells ---
+assemble_and_write_shards(
+    adata=adata,
+    adj_matrix=adj_matrix,
+    embedding_cache=embedding_cache,
+    output_dir=OUTPUT_DIR,
+    k_hops=K_HOPS,
+    max_samples_per_shard=MAX_SAMPLES_PER_SHARD,
+    max_workers=MAX_CPU_WORKERS
+)
+# Phase3 Debug
+# ==============================================================================
+# ======   PHASE 3 (DEBUG VERSION): SUBGRAPH ASSEMBLY WITH IMMEDIATE FAILURE  ======
+# ==============================================================================
+
+def assemble_and_write_shards_DEBUG(adata, adj_matrix, embedding_cache, output_dir, k_hops, max_samples_per_shard):
+    """
+    DEBUG VERSION: Assembles subgraphs and writes them to shards.
+    This version runs SERIALLY and will STOP IMMEDIATELY on the first error.
+    """
+    logging.info("🔥 Phase 3 (DEBUG MODE): Starting subgraph assembly serially...")
+    start_time_phase3 = time.time()
+    
+    os.makedirs(output_dir, exist_ok=True)
+    shards_pattern = os.path.join(output_dir, "shard-%06d.tar")
+    
+    def _assemble_subgraph_worker(center_spot_id: str):
+        """
+        Worker function for a single center spot.
+        """
+        # --- MODIFICATION START ---
+        # Catch specific errors to provide better debug information.
+        try:
+            # a. Get k-hop neighborhood
+            center_node_idx = adata.obs_names.get_loc(center_spot_id)
+            global_indices = get_k_hop_neighborhood(adj_matrix, center_node_idx, k_hops)
+            all_spot_ids = adata.obs_names[global_indices].tolist()
+            
+            # b. Build local graph structure
+            global_id_to_local_idx = {sid: i for i, sid in enumerate(all_spot_ids)}
+            local_edge_index = []
+            for local_u_idx, u_id in enumerate(all_spot_ids):
+                u_global_idx = adata.obs_names.get_loc(u_id)
+                start, end = adj_matrix.indptr[u_global_idx], adj_matrix.indptr[u_global_idx + 1]
+                for v_global_idx in adj_matrix.indices[start:end]:
+                    v_id = adata.obs_names[v_global_idx]
+                    if v_id in global_id_to_local_idx:
+                        local_v_idx = global_id_to_local_idx[v_id]
+                        if local_u_idx < local_v_idx:
+                            local_edge_index.append([local_u_idx, local_v_idx])
+            
+            # c. CRITICAL STEP: Collect pre-computed embeddings from the cache
+            # This is where a KeyError is most likely to occur.
+            img_embeds = [embedding_cache[sid]['image_embed'] for sid in all_spot_ids]
+            txt_embeds = [embedding_cache[sid]['text_embed'] for sid in all_spot_ids]
+            
+            # d. Package into SOTA format
+            embeddings_dict = {
+                'image': torch.stack(img_embeds),
+                'text': torch.stack(txt_embeds)
+            }
+            emb_buf = io.BytesIO()
+            torch.save(embeddings_dict, emb_buf)
+            
+            # e. Assemble the final sample
+            sample = {
+                "__key__": center_spot_id,
+                "json": json.dumps({"num_nodes": len(all_spot_ids), "edge_index": local_edge_index}).encode('utf-8'),
+                "embeddings.pth": emb_buf.getvalue()
+            }
+            return sample, None
+        
+        except KeyError as e:
+            # This is the most likely error. It means a spot in the subgraph was not found in the embedding cache.
+            return None, f"FATAL KeyError: Spot ID '{e.args[0]}' is required for the subgraph of '{center_spot_id}', but it was not found in the embedding_cache. This indicates a failure in the embedding generation phase."
+        except Exception as e:
+            return None, f"FATAL Unexpected Error for spot '{center_spot_id}': {type(e).__name__} - {e}"
+        # --- MODIFICATION END ---
+
+
+    # --- Main Loop (SERIAL EXECUTION for debugging) ---
+    logging.info(f"✍️  Writing shards to: {shards_pattern}")
+    
+    with wds.ShardWriter(shards_pattern, maxcount=max_samples_per_shard) as sink:
+        pbar = tqdm(adata.obs.index, desc="Processing Spots (Serial Debug Mode)", unit="spot")
+        for spot_id in pbar:
+            sample, error_msg = _assemble_subgraph_worker(spot_id)
+            if error_msg:
+                # --- MODIFICATION: Stop on first error ---
+                logging.error("\n" + "="*80)
+                logging.error(f"❌ STOPPED DUE TO ERROR on spot '{spot_id}':")
+                logging.error(error_msg)
+                logging.error("="*80)
+                # You can add a `raise` here if you want a full traceback
+                # raise RuntimeError(error_msg) 
+                return # Stop the function
+            
+            if sample:
+                sink.write(sample)
+
+    logging.info(f"✅ Debug run finished without errors.")
+
+
+# --- Execute the DEBUG version ---
+# NOTE: This will overwrite existing shards in the output directory.
+assemble_and_write_shards_DEBUG(
+    adata=adata,
+    adj_matrix=adj_matrix,
+    embedding_cache=embedding_cache,
+    output_dir=OUTPUT_DIR,
+    k_hops=K_HOPS,
+    max_samples_per_shard=MAX_SAMPLES_PER_SHARD
+)
+# ==============================================================================
+# ========================   CELL: ROOT CAUSE ANALYSIS   =======================
+# ==============================================================================
+
+# 在这里填入上一步中报错的 spot ID
+failed_spot_id = "TENX155_0000x0001" 
+
+print(f"🕵️  正在分析失败的 Spot ID: '{failed_spot_id}'\n")
+
+# --- ANSI Color Codes for Better Readability ---
+class bcolors:
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+
+# 1. 检查它是否在原始数据缓存中 (Phase 1)
+if failed_spot_id in raw_data_cache:
+    print(f"{bcolors.OKGREEN}✅ '{failed_spot_id}' 存在于 raw_data_cache 中。{bcolors.ENDC}")
+    print("   这意味着原始数据（tile, sentence）在 Phase 1 加载成功。")
+else:
+    print(f"{bcolors.FAIL}❌ '{failed_spot_id}' 不存在于 raw_data_cache 中！{bcolors.ENDC}")
+    print(f"{bcolors.WARNING}   => 问题很可能出在 Phase 1。请检查该 spot 对应的原始 .png 和 .txt 文件是否存在且可读。{bcolors.ENDC}")
+
+# 2. 检查它是否在 embedding 缓存中 (Phase 2)
+if failed_spot_id in embedding_cache:
+    print(f"{bcolors.OKGREEN}✅ '{failed_spot_id}' 存在于 embedding_cache 中。 (这不应该发生，如果看到此消息说明判断有误){bcolors.ENDC}")
+else:
+    print(f"{bcolors.FAIL}❌ '{failed_spot_id}' 不存在于 embedding_cache 中！{bcolors.ENDC}")
+    print(f"{bcolors.WARNING}   => 问题确认出在 Phase 2 或之前。如果它在 raw_data_cache 中，则说明在 GPU 推理时被跳过了。{bcolors.ENDC}")
+    
+# 3. 检查总数是否匹配，这能告诉我们问题的普遍性
+print("\n--- Sanity Checks ---")
+print(f"Total spots in AnnData:                  {adata.n_obs}")
+print(f"Spots in raw_data_cache (from Phase 1): {len(raw_data_cache)}")
+print(f"Spots in embedding_cache (from Phase 2): {len(embedding_cache)}")
+
+if len(raw_data_cache) != adata.n_obs:
+    print(f"{bcolors.FAIL}⚠️ 关键发现: Phase 1 丢失了 {adata.n_obs - len(raw_data_cache)} 个 spots！这很可能是问题的根源。{bcolors.ENDC}")
+
+if len(embedding_cache) != len(raw_data_cache):
+     print(f"{bcolors.WARNING}⚠️ 注意: Phase 2 又丢失了 {len(raw_data_cache) - len(embedding_cache)} 个 spots (可能是由于 GPU 推理失败)。{bcolors.ENDC}")
+# ==============================================================================
+# ====================   CELL: MANUAL FILE VERIFICATION   ====================
+# ==============================================================================
+
+def verify_spot_files(spot_id_to_check: str):
+    """
+    根据 AnnData 中的元数据，精确地构造并检查单个 spot 的文件路径。
+    """
+    print(f"\n🔬 手动验证 Spot ID: '{spot_id_to_check}' 的文件...\n")
+    
+    # --- ANSI Color Codes for Better Readability ---
+    class bcolors:
+        OKGREEN = '\033[92m'
+        FAIL = '\033[91m'
+        ENDC = '\033[0m'
+        BOLD = '\033[1m'
+
+    try:
+        spot_metadata = adata.obs.loc[spot_id_to_check]
+        sample_id = spot_metadata['sample_id']
+        
+        print(f"  - 从 AnnData 中找到元数据:")
+        print(f"    - sample_id: {sample_id}")
+        print(f"    - pxl_row_in_fullres: {spot_metadata['pxl_row_in_fullres']}")
+        print(f"    - pxl_col_in_fullres: {spot_metadata['pxl_col_in_fullres']}")
+        
+        # --- 路径构造逻辑 (与你的 Phase 1 worker 完全一致) ---
+        if pd.isna(spot_metadata['pxl_row_in_fullres']) or pd.isna(spot_metadata['pxl_col_in_fullres']):
+            spot_adata_index = adata.obs_names.get_loc(spot_id_to_check)
+            filename_suffix = f"{spot_adata_index}_0_no_coord"
+        else:
+            row_coord = int(round(spot_metadata['pxl_row_in_fullres']))
+            col_coord = int(round(spot_metadata['pxl_col_in_fullres']))
+            filename_suffix = f"{row_coord}_{col_coord}"
+            
+        tile_path = os.path.join(TILES_BASE_DIR, f"{sample_id}_tiles", f"{sample_id}_{filename_suffix}.png")
+        sentence_path = os.path.join(SENTENCES_BASE_DIR, f"{sample_id}_sentences_hvg", f"{sample_id}_{filename_suffix}.txt")
+        
+        print(f"\n  - {bcolors.BOLD}预期瓦片路径:{bcolors.ENDC} {tile_path}")
+        print(f"  - {bcolors.BOLD}预期句子路径:{bcolors.ENDC} {sentence_path}\n")
+        
+        # --- 检查文件 ---
+        tile_exists = os.path.exists(tile_path)
+        sentence_exists = os.path.exists(sentence_path)
+        
+        if tile_exists:
+            print(f"  {bcolors.OKGREEN}[✅] 瓦片文件存在。{bcolors.ENDC}")
+        else:
+            print(f"{bcolors.FAIL}[❌] 瓦片文件不存在！{bcolors.ENDC}")
+
+        if sentence_exists:
+            print(f"{bcolors.OKGREEN}[✅] 句子文件存在。{bcolors.ENDC}")
+        else:
+            print(f"{bcolors.FAIL}[❌] 句子文件不存在！{bcolors.ENDC}")
+            
+        return tile_exists and sentence_exists
+
+    except KeyError:
+        print(f"{bcolors.FAIL}❌ 错误: Spot ID '{spot_id_to_check}' 不在 AnnData 的 .obs 索引中。{bcolors.ENDC}")
+        return False
+    except Exception as e:
+        print(f"{bcolors.FAIL}❌ 发生意外错误: {e}{bcolors.ENDC}")
+        return False
+
+# --- 使用之前失败的 spot ID 进行验证 ---
+verify_spot_files("TENX155_0000x0001")
+# ==============================================================================
+# ======================== CELL: (SOLUTION) CLEAN ADATA ========================
+# ==============================================================================
+
+# 找出所有在 AnnData 中但无法在 Phase 1 成功加载的 spot IDs
+spots_in_adata = set(adata.obs.index)
+spots_in_cache = set(raw_data_cache.keys())
+missing_spot_ids = list(spots_in_adata - spots_in_cache)
+
+logging.info(f"在 AnnData 中发现 {len(missing_spot_ids)} 个 spots 无法加载其原始数据文件。")
+
+if missing_spot_ids:
+    # 过滤 AnnData 对象，只保留那些我们确实拥有原始数据的 spots
+    logging.info("正在过滤 AnnData 对象以移除丢失的 spots...")
+    adata_filtered = adata[list(spots_in_cache)].copy()
+
+    logging.info(f"过滤前的 AnnData 大小: {adata.n_obs}")
+    logging.info(f"过滤后的 AnnData 大小: {adata_filtered.n_obs}")
+
+    # --- 用过滤后的、干净的数据替换旧的变量 ---
+    adata = adata_filtered
+    adj_matrix = adata.obsp['spatial_connectivities'].tocsr()
+
+    logging.info("✅ AnnData 对象已清理。现在可以安全地重新运行 Phase 3。")
+else:
+    logging.info("✅ AnnData 对象与缓存数据一致，无需清理。")
+OUTPUT_DIR =  "/cwStorage/nodecw_group/jijh/spaglam_embedding_shards_2hops"
+# ==============================================================================
+# ======   CELL: RE-RUN PHASE 3 (ROBUST PRODUCTION VERSION)   ======
+# ==============================================================================
+
+def assemble_and_write_shards_ROBUST(adata, adj_matrix, embedding_cache, output_dir, k_hops, max_samples_per_shard, max_workers):
+    """
+    ROBUST PRODUCTION VERSION: Assembles subgraphs in parallel and logs all failures
+    without stopping the entire process.
+    """
+    logging.info("🔥 Phase 3 (ROBUST MODE): Starting parallel subgraph assembly with CLEANED data...")
+    start_time_phase3 = time.time()
+    
+    # 清理输出目录，确保从头开始生成
+    if os.path.exists(output_dir):
+        import shutil
+        shutil.rmtree(output_dir)
+        logging.info(f"Cleaned up previous output directory: {output_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    shards_pattern = os.path.join(output_dir, "shard-%06d.tar")
+    
+    # Worker function to assemble one sample
+    def _assemble_subgraph_worker(center_spot_id: str):
+        try:
+            center_node_idx = adata.obs_names.get_loc(center_spot_id)
+            global_indices = get_k_hop_neighborhood(adj_matrix, center_node_idx, k_hops)
+            all_spot_ids = adata.obs_names[global_indices].tolist()
+            
+            global_id_to_local_idx = {sid: i for i, sid in enumerate(all_spot_ids)}
+            local_edge_index = []
+            for local_u_idx, u_id in enumerate(all_spot_ids):
+                u_global_idx = adata.obs_names.get_loc(u_id)
+                start, end = adj_matrix.indptr[u_global_idx], adj_matrix.indptr[u_global_idx + 1]
+                for v_global_idx in adj_matrix.indices[start:end]:
+                    v_id = adata.obs_names[v_global_idx]
+                    if v_id in global_id_to_local_idx:
+                        local_v_idx = global_id_to_local_idx[v_id]
+                        if local_u_idx < local_v_idx:
+                            local_edge_index.append([local_u_idx, local_v_idx])
+            
+            # This step will no longer fail
+            img_embeds = [embedding_cache[sid]['image_embed'] for sid in all_spot_ids]
+            txt_embeds = [embedding_cache[sid]['text_embed'] for sid in all_spot_ids]
+            
+            embeddings_dict = {'image': torch.stack(img_embeds), 'text': torch.stack(txt_embeds)}
+            emb_buf = io.BytesIO()
+            torch.save(embeddings_dict, emb_buf)
+            
+            sample = {
+                "__key__": center_spot_id,
+                "json": json.dumps({"num_nodes": len(all_spot_ids), "edge_index": local_edge_index}).encode('utf-8'),
+                "embeddings.pth": emb_buf.getvalue()
+            }
+            return sample, None
+        except Exception as e:
+            # This is now a fallback, we don't expect it to be triggered
+            return None, f"Unexpected error for spot '{center_spot_id}': {type(e).__name__} - {e}"
+
+    # Main parallel processing loop
+    failed_spots = {}
+    success_count = 0
+    with wds.ShardWriter(shards_pattern, maxcount=max_samples_per_shard) as sink:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_spot = {executor.submit(_assemble_subgraph_worker, spot_id): spot_id for spot_id in adata.obs.index}
+            
+            pbar = tqdm(as_completed(future_to_spot), total=len(future_to_spot), desc="Assembling & Writing Shards")
+            for future in pbar:
+                spot_id = future_to_spot[future]
+                sample, error_msg = future.result()
+                if sample:
+                    sink.write(sample)
+                    success_count += 1
+                else:
+                    failed_spots[spot_id] = error_msg
+
+    # Final summary and error reporting
+    logging.info(f"✅ Phase 3 finished in {(time.time() - start_time_phase3) / 60:.2f} minutes.")
+    logging.info(f"Successfully created {success_count} samples. Failed: {len(failed_spots)}.")
+    
+    if failed_spots:
+        error_log_path = os.path.join(output_dir, "failed_spots_log.json")
+        with open(error_log_path, 'w') as f:
+            json.dump(failed_spots, f, indent=2)
+        logging.warning(f"⚠️ A detailed log of {len(failed_spots)} failed spots has been saved to: {error_log_path}")
+    else:
+        logging.info("🎉 Zero failures! The dataset was created perfectly.")
+
+# --- Execute the ROBUST version with your cleaned data ---
+assemble_and_write_shards_ROBUST(
+    adata=adata,
+    adj_matrix=adj_matrix,
+    embedding_cache=embedding_cache,
+    output_dir=OUTPUT_DIR,
+    k_hops=K_HOPS,
+    max_samples_per_shard=MAX_SAMPLES_PER_SHARD,
+    max_workers=MAX_CPU_WORKERS
+)
+# ==============================================================================
+# ========================   CELL: ROBUST NOTEBOOK VALIDATION   ================
+# ==============================================================================
+import os
+import glob
+import logging
+import torch
+import webdataset as wds
+from tqdm.auto import tqdm # 使用 notebook 友好的 tqdm
+import json
+import io
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- ANSI Color Codes for Better Readability ---
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKGREEN = '\032[92m' # 更亮的绿色
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+
+# --- CONFIGURATION (从你之前的 Cell 继承) ---
+SHARDS_DIR = "/cwStorage/nodecw_group/jijh/spaglam_embedding_shards_2hops"
+NUM_SAMPLES_TO_CHECK = 500
+EXPECTED_EMBEDDING_DIM = 512
+
+def validate_spaglam_shards_notebook():
+    """
+    A robust, notebook-friendly validation function for SpaGLaM embedding shards.
+    """
+    print(bcolors.HEADER + "="*80 + bcolors.ENDC)
+    print(bcolors.HEADER + "🚀  Starting SpaGLaM Embedding Shard Validation Script (Notebook Edition)" + bcolors.ENDC)
+    print(bcolors.HEADER + "="*80 + bcolors.ENDC)
+    print(f"Directory to validate: {bcolors.OKBLUE}{SHARDS_DIR}{bcolors.ENDC}")
+
+    shard_pattern = os.path.join(SHARDS_DIR, "shard-*.tar")
+    shard_paths = sorted(glob.glob(shard_pattern))
+
+    if not shard_paths:
+        print(f"{bcolors.FAIL}❌ VALIDATION FAILED: No .tar shards found.{bcolors.ENDC}")
+        return
+
+    print(f"✅ Found {len(shard_paths)} shard files. Initializing WebDataset pipeline...")
+    
+    # Key Change 1: 我们不再使用 .decode()，因为我们要手动处理不同类型的文件。
+    # This avoids the TypeError by giving us full control.
+    dataset = wds.WebDataset(shard_paths)
+    
+    # 快速估算总样本数
+    try:
+        total_samples_in_shards = len(list(wds.WebDataset(shard_paths).decode().slice(2000000)))
+    except Exception:
+        # 如果快速计数失败，就只检查设定的数量
+        total_samples_in_shards = NUM_SAMPLES_TO_CHECK
+        print(f"{bcolors.WARNING}Could not quickly determine total sample count. Will check up to {NUM_SAMPLES_TO_CHECK} samples.{bcolors.ENDC}")
+
+    num_to_check = total_samples_in_shards if NUM_SAMPLES_TO_CHECK == -1 else min(NUM_SAMPLES_TO_CHECK, total_samples_in_shards)
+    print(f"🔬 Will now inspect up to {bcolors.BOLD}{num_to_check}{bcolors.ENDC} samples...")
+    
+    error_count = 0
+    node_counts = []
+    pbar = tqdm(dataset, total=num_to_check, desc="Validating samples", unit="sample")
+    
+    for i, sample in enumerate(pbar):
+        if i >= num_to_check:
+            break
+            
+        try:
+            # --- Key Change 2: 手动解码每个文件 ---
+            # 这给了我们处理不同文件类型的灵活性，并修复了bug。
+            metadata = json.loads(sample['json'])
+            embeddings = torch.load(io.BytesIO(sample['embeddings.pth']))
+            
+            # --- 所有检查逻辑保持不变 ---
+            num_nodes = metadata.get('num_nodes')
+            img_embeds, txt_embeds = embeddings['image'], embeddings['text']
+            
+            assert img_embeds.shape[0] == num_nodes, f"Node count mismatch! JSON: {num_nodes}, ImgEmbeds: {img_embeds.shape[0]}"
+            assert txt_embeds.shape[0] == num_nodes, f"Node count mismatch! JSON: {num_nodes}, TxtEmbeds: {txt_embeds.shape[0]}"
+            assert img_embeds.shape[1] == EXPECTED_EMBEDDING_DIM, f"Unexpected image embedding dim. Got {img_embeds.shape[1]}"
+
+            node_counts.append(num_nodes)
+
+        except Exception as e:
+            print(f"\n{bcolors.FAIL}❌ VALIDATION FAILED on sample {i+1} (key: {sample.get('__key__', 'N/A')}):{bcolors.ENDC}")
+            print(f"  - Error: {type(e).__name__} - {e}")
+            error_count += 1
+            break
+            
+    pbar.close()
+
+    # --- 最终总结 ---
+    print("\n" + bcolors.HEADER + "="*80 + bcolors.ENDC)
+    if error_count == 0:
+        print(f"{bcolors.OKGREEN}{bcolors.BOLD}🎉 VALIDATION PASSED!{bcolors.ENDC}")
+        print(f"Checked {len(node_counts)} samples and found no issues.")
+        print("Your dataset is correctly formatted and ready for training.\n")
+        
+        # --- 新增的 Notebook 友好功能：统计信息和可视化 ---
+        if node_counts:
+            print(f"{bcolors.BOLD}📊 Dataset Statistics (from checked samples):{bcolors.ENDC}")
+            print(f"  - Avg nodes per subgraph: {np.mean(node_counts):.2f}")
+            print(f"  - Min nodes per subgraph: {np.min(node_counts)}")
+            print(f"  - Max nodes per subgraph: {np.max(node_counts)}")
+
+            plt.figure(figsize=(10, 5))
+            plt.hist(node_counts, bins=max(1, int(np.max(node_counts) - np.min(node_counts))), edgecolor='black')
+            plt.title('Distribution of Nodes per Subgraph')
+            plt.xlabel('Number of Nodes')
+            plt.ylabel('Frequency')
+            plt.grid(axis='y', alpha=0.75)
+            plt.show()
+    else:
+        print(f"{bcolors.FAIL}{bcolors.BOLD}🙁 VALIDATION FAILED.{bcolors.ENDC}")
+        print("Please review the error message above to diagnose the problem.")
+    print(bcolors.HEADER + "="*80 + bcolors.ENDC)
+
+# --- 运行验证 ---
+validate_spaglam_shards_notebook()

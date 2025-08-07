@@ -1,0 +1,886 @@
+# ===== CELL 1: SETUP AND IMPORTS =====
+
+# Uncomment the line below if you need to install the required packages
+# !pip install -q scanpy webdataset torch "tqdm>=4.62.0"
+
+import os
+import json
+import logging
+import time
+from tqdm.notebook import tqdm  # Use the notebook-specific version for clean progress bars
+import scanpy as sc
+import webdataset as wds
+
+# --- Setup Logging ---
+# This will print informative messages directly to the notebook output.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+# ===== CELL 2: CONFIGURATION =====
+# --- Please edit the paths and parameters below ---
+
+# Path to your master AnnData file, which contains the graph and file paths.
+ADATA_PATH = "/cwStorage/nodecw_group/jijh/spaglam_sota_data/master_adata_with_graph_and_paths.h5ad"
+
+# --- NEW: Define the base directories where your raw tiles and sentences are stored ---
+# This mirrors the structure from your reference scripts.
+TILES_BASE_DIR = "/cwStorage/nodecw_group/jijh/hest_output"
+SENTENCES_BASE_DIR = "/cwStorage/nodecw_group/jijh/hest_sentences_human_all"
+
+# Directory where the new, pre-packaged .tar shards will be saved.
+# This directory will be created if it doesn't exist.
+OUTPUT_DIR = "/cwStorage/nodecw_group/jijh/spaglam_precom_subgraphs"
+
+# The maximum number of samples (center spots) to include in each .tar shard file.
+# A smaller number means more, smaller files. 10,000 is a reasonable default.
+MAX_SAMPLES_PER_SHARD = 10000
+
+# --- End of configuration ---
+# ===== CELL 3: THE CORE DATA CREATION FUNCTION (CORRECTED AND PARALLELIZED) =====
+
+import os
+import json
+import logging
+import time
+import pandas as pd
+from tqdm.notebook import tqdm
+import scanpy as sc
+import webdataset as wds
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def _process_spot(center_spot_id, adata, tiles_base_dir, sentences_base_dir):
+    """
+    Worker function to process a single spot. Encapsulates the logic for one item.
+    Returns a sample dictionary on success, None on failure.
+    """
+    try:
+        # a. Get 1-hop neighborhood
+        center_idx_global = adata.obs_names.get_loc(center_spot_id)
+        neighbor_indices = adata.obsp['spatial_connectivities'][center_idx_global].indices
+        neighbor_ids = adata.obs_names[neighbor_indices].tolist()
+        all_spot_ids = [center_spot_id] + neighbor_ids
+        
+        # b. Build local graph structure
+        id_to_local_idx = {spot_id: i for i, spot_id in enumerate(all_spot_ids)}
+        edge_list = []
+        for u_spot_id in all_spot_ids:
+            u_global_idx = adata.obs_names.get_loc(u_spot_id)
+            u_global_neighbors = adata.obs_names[adata.obsp['spatial_connectivities'][u_global_idx].indices]
+            for v_spot_id in u_global_neighbors:
+                if v_spot_id in id_to_local_idx:
+                    local_idx_u = id_to_local_idx[u_spot_id]
+                    local_idx_v = id_to_local_idx[v_spot_id]
+                    if local_idx_u < local_idx_v:
+                        edge_list.append([local_idx_u, local_idx_v])
+        
+        # c. Prepare the sample dictionary
+        sample = {"__key__": center_spot_id}
+        sample["json"] = json.dumps({"num_nodes": len(all_spot_ids), "edge_index": edge_list}).encode('utf-8')
+
+        # d. Dynamically CONSTRUCT paths for all nodes and load data
+        for spot_id in all_spot_ids:
+            local_idx = id_to_local_idx[spot_id]
+            spot_metadata = adata.obs.loc[spot_id]
+            
+            sample_id = spot_metadata['sample_id']
+            row_val = spot_metadata['pxl_row_in_fullres']
+            col_val = spot_metadata['pxl_col_in_fullres']
+            
+            if pd.isna(row_val) or pd.isna(col_val):
+                spot_adata_index = adata.obs_names.get_loc(spot_id)
+                filename_suffix = f"{spot_adata_index}_0_no_coord"
+            else:
+                row_coord = int(round(row_val))
+                col_coord = int(round(col_val))
+                filename_suffix = f"{row_coord}_{col_coord}"
+                
+            tile_path = os.path.join(tiles_base_dir, f"{sample_id}_tiles", f"{sample_id}_{filename_suffix}.png")
+            sentence_path = os.path.join(sentences_base_dir, f"{sample_id}_sentences_hvg", f"{sample_id}_{filename_suffix}.txt")
+
+            with open(tile_path, 'rb') as f_img:
+                sample[f"{local_idx}.png"] = f_img.read()
+            with open(sentence_path, 'rb') as f_txt:
+                sample[f"{local_idx}.txt"] = f_txt.read()
+
+        return sample
+
+    except Exception as e:
+        # Log errors at a lower level for parallel execution to avoid clutter
+        # logging.debug(f"Skipping {center_spot_id} -> Error: {e}")
+        return None
+
+
+def create_prepackaged_dataset(
+    adata_path: str, 
+    tiles_base_dir: str,
+    sentences_base_dir: str,
+    output_dir: str, 
+    max_shard_size: int,
+    max_workers: int = 16
+):
+    """
+    Main function to perform pre-packaging, now parallelized with ThreadPoolExecutor.
+
+    Args:
+        adata_path (str): Path to the master AnnData file.
+        tiles_base_dir (str): Base directory containing sample-specific tile folders.
+        sentences_base_dir (str): Base directory containing sample-specific sentence folders.
+        output_dir (str): Directory to save the output .tar shards.
+        max_shard_size (int): Max samples per shard.
+        max_workers (int): Number of worker threads for parallel processing.
+    """
+    logging.info(f"Starting data pre-packaging process with {max_workers} workers.")
+    start_time = time.time()
+    
+    # --- 1. Validation and Setup ---
+    os.makedirs(output_dir, exist_ok=True)
+    shards_pattern = os.path.join(output_dir, "shard-%06d.tar")
+    
+    # --- 2. Load AnnData ---
+    logging.info(f"Loading AnnData: {adata_path}")
+    adata = sc.read_h5ad(adata_path)
+    logging.info(f"✅ AnnData loaded. Total spots: {adata.n_obs}")
+
+    required_obs = ['sample_id', 'pxl_col_in_fullres', 'pxl_row_in_fullres']
+    if not all(col in adata.obs.columns for col in required_obs):
+        raise ValueError(f"AnnData .obs must contain the columns: {required_obs}")
+    if 'spatial_connectivities' not in adata.obsp:
+        raise ValueError("AnnData must contain 'spatial_connectivities' in .obsp")
+
+    # --- 3. Main Loop (Parallelized) ---
+    logging.info(f"Writing shards to: {shards_pattern}")
+    error_count = 0
+    success_count = 0
+    
+    with wds.ShardWriter(shards_pattern, maxcount=max_shard_size) as sink:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks to the executor
+            futures = {
+                executor.submit(_process_spot, spot_id, adata, tiles_base_dir, sentences_base_dir): spot_id 
+                for spot_id in adata.obs.index
+            }
+            
+            # Process results as they complete
+            progress_bar = tqdm(as_completed(futures), total=len(futures), desc="Processing Spots", unit="spot")
+            for future in progress_bar:
+                result = future.result()
+                if result is not None:
+                    sink.write(result)
+                    success_count += 1
+                else:
+                    spot_id = futures[future]
+                    logging.warning(f"Skipping {spot_id} due to an error during processing.")
+                    error_count += 1
+
+    # Final summary
+    total_time = time.time() - start_time
+    logging.info("\n" + "="*50)
+    logging.info("✅ Pre-packaging complete!")
+    logging.info(f"New dataset saved to: {output_dir}")
+    logging.info(f"Total spots processed: {adata.n_obs}")
+    logging.info(f"Successfully packaged samples: {success_count}")
+    logging.info(f"Samples skipped due to errors: {error_count}")
+    logging.info(f"Total time: {total_time / 60:.2f} minutes")
+    logging.info("="*50)
+# ===== CELL 4: EXECUTE THE PROCESS (UPDATED) =====
+
+# This will call the function from CELL 3 with the configuration from CELL 2.
+create_prepackaged_dataset(
+    adata_path=ADATA_PATH,
+    tiles_base_dir=TILES_BASE_DIR,
+    sentences_base_dir=SENTENCES_BASE_DIR,
+    output_dir=OUTPUT_DIR,
+    max_shard_size=MAX_SAMPLES_PER_SHARD
+)
+# Check for the reason of error
+# FILE: debug_spot.py
+# PURPOSE: To diagnose processing errors for a single spot during webdataset creation.
+
+import os
+import json
+import logging
+import pandas as pd
+import scanpy as sc
+from PIL import Image
+
+# --- CONFIGURATION ---
+# Please fill in these values with your project's paths and the spot ID to debug.
+
+# Path to your master AnnData file.
+ADATA_PATH = "/cwStorage/nodecw_group/jijh/hest_cache/cache/adata_preprocessed_canonical_v2.h5ad" 
+
+# Base directory where sample-specific tile folders are located.
+TILES_BASE_DIR = "/cwStorage/nodecw_group/jijh/hest_output"
+
+# Base directory where sample-specific sentence folders are located.
+SENTENCES_BASE_DIR = "/cwStorage/nodecw_group/jijh/hest_sentences_human_all"
+
+# The specific Spot ID that was reported as "Skipping" in the logs.
+SPOT_ID_TO_DEBUG = "TENX155_0000x0001" 
+
+# --- END OF CONFIGURATION ---
+
+
+# --- ANSI Color Codes for Better Readability ---
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+def debug_single_spot(adata, center_spot_id: str):
+    """
+    Performs a step-by-step diagnostic for a single center spot.
+    """
+    print(f"{bcolors.HEADER}{'='*20} STARTING DIAGNOSTIC FOR SPOT: {center_spot_id} {'='*20}{bcolors.ENDC}")
+    
+    # --- Step 1: Check if center spot exists in AnnData ---
+    if center_spot_id not in adata.obs.index:
+        print(f"{bcolors.FAIL}❌ FATAL: Center spot ID '{center_spot_id}' not found in AnnData object's index.{bcolors.ENDC}")
+        return False
+    print(f"{bcolors.OKGREEN}✅ Center spot '{center_spot_id}' found in AnnData.{bcolors.ENDC}")
+
+    # --- Step 2: Retrieve 1-hop neighborhood ---
+    try:
+        center_idx_global = adata.obs_names.get_loc(center_spot_id)
+        neighbor_indices = adata.obsp['spatial_connectivities'][center_idx_global].indices
+        neighbor_ids = adata.obs_names[neighbor_indices].tolist()
+        all_spot_ids = [center_spot_id] + neighbor_ids
+        print(f"{bcolors.OKGREEN}✅ Found {len(neighbor_ids)} neighbors for '{center_spot_id}'. Total subgraph size: {len(all_spot_ids)} nodes.{bcolors.ENDC}")
+    except Exception as e:
+        print(f"{bcolors.FAIL}❌ FATAL: Could not retrieve neighbors for '{center_spot_id}'. Error: {e}{bcolors.ENDC}")
+        return False
+
+    # --- Step 3: Iterate and check each file for each node in the subgraph ---
+    all_checks_passed = True
+    print(f"\n{bcolors.HEADER}--- Checking all {len(all_spot_ids)} nodes in the subgraph ---{bcolors.ENDC}")
+
+    for i, spot_id in enumerate(all_spot_ids):
+        is_center = " (Center Spot)" if spot_id == center_spot_id else " (Neighbor)"
+        print(f"\n{bcolors.OKBLUE}Checking node {i+1}/{len(all_spot_ids)}: '{spot_id}'{is_center}{bcolors.ENDC}")
+        
+        try:
+            spot_metadata = adata.obs.loc[spot_id]
+            
+            # --- Path Construction Logic (Mirrors the creation script) ---
+            sample_id = spot_metadata['sample_id']
+            row_val = spot_metadata['pxl_row_in_fullres']
+            col_val = spot_metadata['pxl_col_in_fullres']
+            
+            if pd.isna(row_val) or pd.isna(col_val):
+                spot_adata_index = adata.obs_names.get_loc(spot_id)
+                filename_suffix = f"{spot_adata_index}_0_no_coord"
+            else:
+                row_coord = int(round(row_val))
+                col_coord = int(round(col_val))
+                filename_suffix = f"{row_coord}_{col_coord}"
+            
+            tile_path = os.path.join(TILES_BASE_DIR, f"{sample_id}_tiles", f"{sample_id}_{filename_suffix}.png")
+            sentence_path = os.path.join(SENTENCES_BASE_DIR, f"{sample_id}_sentences_hvg", f"{sample_id}_{filename_suffix}.txt")
+
+            print(f"  - Tile path constructed: {tile_path}")
+            print(f"  - Text path constructed: {sentence_path}")
+
+            # --- File Existence Check ---
+            tile_exists = os.path.exists(tile_path)
+            if not tile_exists:
+                print(f"  {bcolors.FAIL}❌ FAILED: Tile file does NOT exist.{bcolors.ENDC}")
+                all_checks_passed = False
+            else:
+                print(f"  {bcolors.OKGREEN}✅ SUCCESS: Tile file exists.{bcolors.ENDC}")
+                # --- File Readability Check ---
+                try:
+                    with Image.open(tile_path) as img:
+                        img.load() # Force loading the image data to check for corruption
+                    print(f"  {bcolors.OKGREEN}✅ SUCCESS: Tile file is a valid, readable image.{bcolors.ENDC}")
+                except Exception as img_e:
+                    print(f"  {bcolors.FAIL}❌ FAILED: Tile file exists but is corrupted or unreadable. Error: {img_e}{bcolors.ENDC}")
+                    all_checks_passed = False
+
+            text_exists = os.path.exists(sentence_path)
+            if not text_exists:
+                print(f"  {bcolors.FAIL}❌ FAILED: Text file does NOT exist.{bcolors.ENDC}")
+                all_checks_passed = False
+            else:
+                print(f"  {bcolors.OKGREEN}✅ SUCCESS: Text file exists.{bcolors.ENDC}")
+
+        except KeyError as ke:
+            print(f"  {bcolors.FAIL}❌ FAILED: Metadata lookup failed for spot '{spot_id}'. Is it correctly indexed in adata.obs? Error: {ke}{bcolors.ENDC}")
+            all_checks_passed = False
+        except Exception as e:
+            print(f"  {bcolors.FAIL}❌ FAILED: An unexpected error occurred for spot '{spot_id}'. Error: {e}{bcolors.ENDC}")
+            all_checks_passed = False
+
+    # --- Final Verdict ---
+    print(f"\n{bcolors.HEADER}{'='*25} DIAGNOSTIC SUMMARY {'='*26}{bcolors.ENDC}")
+    if all_checks_passed:
+        print(f"{bcolors.OKGREEN}✅ All files for the subgraph centered at '{center_spot_id}' were found and are readable.{bcolors.ENDC}")
+        print("The issue might be with a different spot or a more subtle problem. Try another skipped spot.")
+    else:
+        print(f"{bcolors.FAIL}❌ One or more files are missing or corrupted for the subgraph of '{center_spot_id}'.{bcolors.ENDC}")
+        print("Please review the logs above to identify the exact missing file(s). Check the output of your tile/sentence generation scripts for these specific spots.")
+    print("="*78)
+    return all_checks_passed
+
+
+
+
+ADATA_PATH = "/cwStorage/nodecw_group/jijh/spaglam_sota_data/master_adata_with_graph_and_paths.h5ad"
+# Load AnnData once to be passed to the function
+try:
+    main_adata = sc.read_h5ad(ADATA_PATH)
+    debug_single_spot(main_adata, SPOT_ID_TO_DEBUG)
+except FileNotFoundError:
+    print(f"{bcolors.FAIL}FATAL ERROR: Could not find AnnData file at '{ADATA_PATH}'. Please check the path in the CONFIGURATION section.{bcolors.ENDC}")
+except Exception as e:
+    print(f"{bcolors.FAIL}An error occurred during script execution: {e}{bcolors.ENDC}")
+SPOT_ID_TO_DEBUG = "TENX155_0000x0001"  # Replace with the actual Spot ID you want to debug
+debug_single_spot(main_adata, SPOT_ID_TO_DEBUG)
+SPOT_ID_TO_DEBUG = "NCBI861_012x024"
+debug_single_spot(main_adata, SPOT_ID_TO_DEBUG)
+# Decompress the files
+# ===== CELL A: .gz Decompression and Backup Utility =====
+
+import os
+import gzip
+import shutil
+from tqdm.notebook import tqdm
+
+# --- CONFIGURATION FOR DECOMPRESSION ---
+# 请将这些路径设置为您存放原始瓦片和句子文件的根目录
+# 脚本会递归地扫描这些目录及其所有子目录
+DIRECTORIES_TO_SCAN = [
+    "/cwStorage/nodecw_group/jijh/hest_output",        # 包含 ..._tiles 文件夹的根目录
+    "/cwStorage/nodecw_group/jijh/hest_sentences_human_all" # 包含 ..._sentences_hvg 文件夹的根目录
+]
+# --- END OF CONFIGURATION ---
+
+def decompress_and_backup_gz_files(root_dirs: list):
+    """
+    Recursively scans directories, finds .gz files, moves them to a backup
+    folder, and leaves the decompressed version in the original location.
+    """
+    print(f"🔍 开始扫描目录: {root_dirs}")
+    total_found = 0
+    total_processed = 0
+    
+    for root_dir in root_dirs:
+        if not os.path.isdir(root_dir):
+            print(f"⚠️ 警告: 目录不存在，跳过: {root_dir}")
+            continue
+            
+        # 使用 os.walk 遍历所有子目录和文件
+        file_list = []
+        for dirpath, _, filenames in os.walk(root_dir):
+            for filename in filenames:
+                if filename.endswith(".gz"):
+                    file_list.append(os.path.join(dirpath, filename))
+        
+        if not file_list:
+            print(f"✅ 在 '{root_dir}' 中没有找到 .gz 文件。")
+            continue
+
+        print(f"在 '{root_dir}' 中找到 {len(file_list)} 个 .gz 文件，开始处理...")
+        total_found += len(file_list)
+        
+        with tqdm(total=len(file_list), desc=f"处理 {os.path.basename(root_dir)}") as pbar:
+            for gz_path in file_list:
+                try:
+                    # 1. 确定原始文件名和备份路径
+                    original_path = gz_path[:-3]  # 去掉 ".gz" 后缀
+                    backup_dir = os.path.dirname(gz_path) + "_gz_backup"
+                    os.makedirs(backup_dir, exist_ok=True)
+                    backup_path = os.path.join(backup_dir, os.path.basename(gz_path))
+                    
+                    # 2. 移动 .gz 文件到备份目录
+                    shutil.move(gz_path, backup_path)
+                    
+                    # 3. 从备份位置解压到原始位置
+                    with gzip.open(backup_path, 'rb') as f_in:
+                        with open(original_path, 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                    
+                    total_processed += 1
+                except Exception as e:
+                    print(f"\n❌ 处理文件 '{gz_path}' 时出错: {e}")
+                finally:
+                    pbar.update(1)
+
+    print("\n" + "="*50)
+    print("✅ 全部处理完成！")
+    print(f"总共找到 .gz 文件: {total_found}")
+    print(f"成功处理并恢复的文件: {total_processed}")
+    print("="*50)
+
+# --- 运行修复工具 ---
+decompress_and_backup_gz_files(DIRECTORIES_TO_SCAN)
+# Fixed Scripts
+# ===== CELL 1: SETUP AND IMPORTS =====
+import os
+import json
+import logging
+import time
+from tqdm.notebook import tqdm
+import pandas as pd
+import scanpy as sc
+import webdataset as wds
+import shutil
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+ADATA_PATH
+# ===== CELL 2: CONFIGURATION (CORRECTED) =====
+
+# Path to your master AnnData file.
+ADATA_PATH = "/cwStorage/nodecw_group/jijh/spaglam_sota_data/master_adata_with_graph_and_paths.h5ad"
+
+# --- NEW: Base directories for your source tiles and sentences ---
+TILES_BASE_DIR = "/cwStorage/nodecw_group/jijh/hest_output"
+SENTENCES_BASE_DIR = "/cwStorage/nodecw_group/jijh/hest_sentences_human_all"
+
+# Directory where the new, pre-packaged .tar shards will be saved.
+OUTPUT_DIR = "/cwStorage/nodecw_group/jijh/spaglam_precom_subgraphs"
+
+# The maximum number of samples (center spots) to include in each .tar shard file.
+MAX_SAMPLES_PER_SHARD = 10000
+from concurrent.futures import ThreadPoolExecutor
+
+# ===== CELL 3: THE CORE DATA CREATION FUNCTION (CORRECTED WITH THREADPOOL) =====
+
+import concurrent.futures
+
+def create_prepackaged_dataset(adata_path, tiles_base_dir, sentences_base_dir, output_dir, max_shard_size):
+    logging.info("🚀 Starting data pre-packaging with corrected path logic and ThreadPool acceleration.")
+    start_time = time.time()
+    
+    # 1. Setup & Validation
+    os.makedirs(output_dir, exist_ok=True)
+    shards_pattern = os.path.join(output_dir, "shard-%06d.tar")
+    
+    # 2. Load AnnData
+    logging.info(f"💾 Loading AnnData: {adata_path}")
+    adata = sc.read_h5ad(adata_path)
+    logging.info(f"✅ AnnData loaded. Total spots: {adata.n_obs}")
+
+    def process_spot(center_spot_id):
+        """Process a single spot and return the sample data"""
+        try:
+            # a. Get 1-hop neighborhood
+            center_idx_global = adata.obs_names.get_loc(center_spot_id)
+            neighbor_indices = adata.obsp['spatial_connectivities'][center_idx_global].indices
+            neighbor_ids = adata.obs_names[neighbor_indices].tolist()
+            all_spot_ids = [center_spot_id] + neighbor_ids
+            
+            # b. Build local graph structure
+            id_to_local_idx = {spot_id: i for i, spot_id in enumerate(all_spot_ids)}
+            edge_list = []
+            for u_spot_id in all_spot_ids:
+                u_global_idx = adata.obs_names.get_loc(u_spot_id)
+                u_global_neighbors = adata.obs_names[adata.obsp['spatial_connectivities'][u_global_idx].indices]
+                for v_spot_id in u_global_neighbors:
+                    if v_spot_id in id_to_local_idx:
+                        local_idx_u, local_idx_v = id_to_local_idx[u_spot_id], id_to_local_idx[v_spot_id]
+                        if local_idx_u < local_idx_v:
+                            edge_list.append([local_idx_u, local_idx_v])
+            
+            # c. Prepare sample and metadata
+            sample = {"__key__": center_spot_id}
+            sample["json"] = json.dumps({"num_nodes": len(all_spot_ids), "edge_index": edge_list}).encode('utf-8')
+
+            # d. Load data for all nodes in the subgraph
+            for spot_id in all_spot_ids:
+                local_idx = id_to_local_idx[spot_id]
+                spot_metadata = adata.obs.loc[spot_id]
+                
+                sample_id = spot_metadata['sample_id']
+                
+                # Correctly handle coordinates, including potential NaNs
+                if pd.isna(spot_metadata['pxl_row_in_fullres']) or pd.isna(spot_metadata['pxl_col_in_fullres']):
+                    spot_adata_index = adata.obs_names.get_loc(spot_id)
+                    filename_suffix = f"{spot_adata_index}_0_no_coord"
+                else:
+                    row_coord = int(round(spot_metadata['pxl_row_in_fullres']))
+                    col_coord = int(round(spot_metadata['pxl_col_in_fullres']))
+                    filename_suffix = f"{row_coord}_{col_coord}"
+                    
+                # Construct the full, correct paths
+                tile_path = os.path.join(tiles_base_dir, f"{sample_id}_tiles", f"{sample_id}_{filename_suffix}.png")
+                sentence_path = os.path.join(sentences_base_dir, f"{sample_id}_sentences_hvg", f"{sample_id}_{filename_suffix}.txt")
+                
+                # Read files using the constructed paths
+                with open(tile_path, 'rb') as f_img:
+                    sample[f"{local_idx}.png"] = f_img.read()
+                with open(sentence_path, 'rb') as f_txt:
+                    sample[f"{local_idx}.txt"] = f_txt.read()
+            
+            return sample, None
+            
+        except (FileNotFoundError, KeyError) as e:
+            return None, f"File or Key not found: {e}"
+        except Exception as e:
+            return None, f"Unexpected error: {type(e).__name__} - {e}"
+
+    # 3. Main Loop with ThreadPool
+    logging.info(f"✍️ Writing shards to: {shards_pattern}")
+    error_count = 0
+    success_count = 0
+    
+    with wds.ShardWriter(shards_pattern, maxcount=max_shard_size) as sink:
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            # Submit all tasks
+            future_to_spot = {executor.submit(process_spot, spot_id): spot_id 
+                             for spot_id in adata.obs.index}
+            
+            # Process completed tasks with progress bar
+            for future in tqdm(concurrent.futures.as_completed(future_to_spot), 
+                              total=len(future_to_spot), desc="Processing Spots", unit="spot"):
+                spot_id = future_to_spot[future]
+                try:
+                    sample, error = future.result()
+                    if sample is not None:
+                        sink.write(sample)
+                        success_count += 1
+                    else:
+                        logging.warning(f"Skipping '{spot_id}' -> {error}")
+                        error_count += 1
+                except Exception as e:
+                    logging.warning(f"Skipping '{spot_id}' -> Future exception: {type(e).__name__} - {e}")
+                    error_count += 1
+    
+    # Final summary
+    total_time = time.time() - start_time
+    logging.info("\n" + "="*60)
+    logging.info("✅ Pre-packaging complete!")
+    logging.info(f"New dataset saved to: {output_dir}")
+    logging.info(f"Successfully packaged samples: {success_count}")
+    logging.info(f"Samples skipped due to errors: {error_count}")
+    logging.info(f"Total time: {total_time / 60:.2f} minutes")
+    logging.info("="*60)
+# ===== CELL 4: EXECUTE THE PROCESS =====
+
+# Run the function from CELL 3 using the configuration from CELL 2.
+create_prepackaged_dataset(
+    adata_path=ADATA_PATH,
+    tiles_base_dir=TILES_BASE_DIR,
+    sentences_base_dir=SENTENCES_BASE_DIR,
+    output_dir=OUTPUT_DIR,
+    max_shard_size=MAX_SAMPLES_PER_SHARD
+)
+OUTPUT_DIR
+import webdataset as wds
+import json
+from PIL import Image
+import io
+import numpy as np
+import os
+import glob
+import matplotlib.pyplot as plt
+
+# 1. Define your output directory
+OUTPUT_DIR = "/cwStorage/nodecw_group/jijh/spaglam_precom_subgraphs"
+
+# 2. Use glob to expand the wildcard into a sorted list of .tar paths
+shard_paths = sorted(glob.glob(os.path.join(OUTPUT_DIR, "shard-*.tar")))
+if not shard_paths:
+    raise FileNotFoundError(f"No shards found in {OUTPUT_DIR}")
+
+# 3. Create the WebDataset from the list of files
+dataset = wds.WebDataset(shard_paths).decode("pil")  # or decode as you need
+
+def verify_webdataset_loading(dataset, num_samples_to_show=3):
+    print(f"🔍 Verifying loading from {len(shard_paths)} shard files")
+    # Quickly count
+    count = 0
+    for _ in dataset:
+        count += 1
+        if count >= 100:
+            break
+    print(f"✅ Successfully loaded and iterated {count} samples\n")
+
+    # Show detailed info for a few samples
+    it = iter(dataset)
+    for i in range(num_samples_to_show):
+        try:
+            sample = next(it)
+            print(f"--- Sample {i+1} (key={sample['__key__']}) ---")
+            meta = sample["json"]  # Already decoded as dict
+            print(f"  • Nodes: {meta['num_nodes']}, Edges: {len(meta['edge_index'])}")
+            imgs = [k for k in sample if k.endswith(".png")]
+            print(f"  • Found {len(imgs)} image(s): {imgs}")
+            # load and inspect one image
+            if imgs:
+                img = sample[imgs[0]]
+                print(f"    – {imgs[0]} size={img.size}, mode={img.mode}")
+        except StopIteration:
+            print("⚠️ Ran out of samples.")
+            break
+
+def visualize_sample_subgraph(dataset, sample_index=0, max_nodes=4):
+    it = iter(dataset)
+    for _ in range(sample_index + 1):
+        try:
+            sample = next(it)
+        except StopIteration:
+            print(f"⚠️ No sample at index {sample_index}")
+            return
+
+    meta = sample["json"]  # Already decoded as dict
+    num_nodes = meta["num_nodes"]
+    edges    = meta["edge_index"]
+
+    print(f"Subgraph: {num_nodes} nodes, {len(edges)} edges")
+    cols = min(num_nodes, max_nodes)
+    fig, axes = plt.subplots(2, cols, figsize=(4*cols, 6))
+    for i in range(cols):
+        img_key = f"{i}.png"
+        txt_key = f"{i}.txt"
+        # image
+        if img_key in sample:
+            axes[0, i].imshow(sample[img_key])
+            axes[0, i].axis("off")
+            axes[0, i].set_title(f"Node {i}")
+        # text
+        if txt_key in sample:
+            text = sample[txt_key]
+            axes[1, i].text(0, 1, text[:200]+"…" if len(text)>200 else text,
+                            va="top", wrap=True)
+            axes[1, i].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+    print("\nEdges:")
+    for u, v in edges:
+        print(f"  {u} ↔ {v}")
+
+# Run verification
+verify_webdataset_loading(dataset)
+visualize_sample_subgraph(dataset, sample_index=0)
+
+
+
+# precompute_embeddings.py
+
+import os
+import io
+import json
+import logging
+import time
+from functools import partial
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import glob
+import collections
+
+import torch
+import webdataset as wds
+from PIL import Image
+from tqdm import tqdm
+
+# It's crucial that this script can import your open_clip library
+# Make sure your project is installed or the PYTHONPATH is set correctly.
+try:
+    import open_clip
+except ImportError:
+    print("Error: open_clip library not found.")
+    print("Please ensure the directory containing the 'open_clip' package is in your PYTHONPATH,")
+    print("or install your project in editable mode (e.g., `pip install -e .`)")
+    exit(1)
+
+# --- 1. CONFIGURATION (Please edit these paths) ---
+
+# --- INPUTS ---
+INPUT_SHARDS_DIR = "/cwStorage/nodecw_group/jijh/spaglam_precom_subgraphs"
+BASE_MODEL_PATH = "/cwStorage/nodecw_group/jijh/training_log/cfff_train/openclip_train/train_log/finetune_20250623-092915/2025_06_23-09_30_48-model_ViT-B-32-lr_2e-05-b_1800-j_16-p_amp_bfloat16/checkpoints/epoch_25.pt"
+MODEL_NAME = "ViT-B-32"
+
+# --- OUTPUT ---
+OUTPUT_EMBEDDING_DIR = "/cwStorage/nodecw_group/jijh/spaglam_embedding_shards"
+
+# --- PERFORMANCE ---
+MAX_SAMPLES_PER_SHARD = 10000
+MAX_WORKERS = 32  # Number of CPU threads for reading/decoding raw data
+LOG_INTERVAL_SECONDS = 60 # How often to print performance stats
+
+# --- End of Configuration ---
+
+
+def setup_logging():
+    """Configures logging for the script."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+def process_and_encode_sample(sample, model, image_preprocessor, tokenizer, device):
+    """
+    Worker function: Takes one raw data sample, encodes its contents, 
+    and returns a new sample dictionary with embeddings.
+    Now returns an error message on failure for detailed reporting.
+    """
+    try:
+        key = sample['__key__']
+        
+        # 1. Decode metadata and raw data
+        metadata = json.loads(sample['json'])
+        num_nodes = metadata['num_nodes']
+        
+        images_to_process = []
+        texts_to_tokenize = []
+        for i in range(num_nodes):
+            images_to_process.append(Image.open(io.BytesIO(sample[f'{i}.png'])).convert("RGB"))
+            texts_to_tokenize.append(sample[f'{i}.txt'].decode('utf-8'))
+
+        # 2. Preprocess data into tensors
+        image_input = torch.stack([image_preprocessor(img) for img in images_to_process])
+        text_input = tokenizer(texts_to_tokenize)
+
+        # 3. Encode on GPU
+        with torch.no_grad():
+            image_input = image_input.to(device)
+            text_input = text_input.to(device)
+            
+            image_embeddings = model.encode_image(image_input).cpu()
+            text_embeddings = model.encode_text(text_input).cpu()
+
+        # 4. Construct the new sample with serialized tensor embeddings
+        output_sample = {"__key__": key, "json": sample['json']}
+        for i in range(num_nodes):
+            img_buffer = io.BytesIO()
+            torch.save(image_embeddings[i], img_buffer)
+            output_sample[f"{i}.image.pth"] = img_buffer.getvalue()
+
+            txt_buffer = io.BytesIO()
+            torch.save(text_embeddings[i], txt_buffer)
+            output_sample[f"{i}.text.pth"] = txt_buffer.getvalue()
+        
+        return output_sample, None
+    
+    except Exception as e:
+        error_type = type(e).__name__
+        return None, f"Sample {sample.get('__key__', 'UNKNOWN_KEY')} failed with {error_type}: {e}"
+
+
+def create_embedding_dataset():
+    """Main function to drive the pre-computation and sharding process."""
+    setup_logging()
+    
+    logging.info("=" * 80)
+    logging.info("🚀 Starting Embedding Pre-computation Script")
+    logging.info("=" * 80)
+    logging.info("CONFIGURATION:")
+    logging.info(f"  - Input Raw Shards:     {INPUT_SHARDS_DIR}")
+    logging.info(f"  - Output Embedding Shards: {OUTPUT_EMBEDDING_DIR}")
+    logging.info(f"  - Base Model Path:        {BASE_MODEL_PATH}")
+    logging.info(f"  - Model Architecture:     {MODEL_NAME}")
+    logging.info(f"  - Max Samples per Shard:  {MAX_SAMPLES_PER_SHARD}")
+    logging.info(f"  - Max CPU Workers:        {MAX_WORKERS}")
+    logging.info("-" * 80)
+    
+    start_time = time.time()
+    
+    # --- 1. Setup paths and model ---
+    os.makedirs(OUTPUT_EMBEDDING_DIR, exist_ok=True)
+    if any(os.scandir(OUTPUT_EMBEDDING_DIR)):
+        logging.warning(f"⚠️ Output directory '{OUTPUT_EMBEDDING_DIR}' is not empty. Files may be overwritten.")
+        
+    shards_pattern = os.path.join(OUTPUT_EMBEDDING_DIR, "shard-%06d.tar")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logging.info(f"🔌 Using device: {device}")
+
+    logging.info(f"🔧 Loading OmiCLIP model '{MODEL_NAME}'...")
+    model, _, image_preprocessor = open_clip.create_model_and_transforms(
+        MODEL_NAME,
+        pretrained=BASE_MODEL_PATH,
+        device=device,
+        output_dict=True,
+    )
+    model.eval()
+    tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+    logging.info("✅ Model and preprocessors loaded successfully.")
+
+    input_shards = sorted(glob.glob(os.path.join(INPUT_SHARDS_DIR, "*.tar")))
+    if not input_shards:
+        logging.error(f"❌ No input shards found at: {os.path.join(INPUT_SHARDS_DIR, '*.tar')}")
+        return
+        
+    logging.info(f"📚 Found {len(input_shards)} input shards to process.")
+
+    # --- 2. Run the processing and writing loop ---
+    logging.info(f"✍️  Writing new embedding shards to: {shards_pattern}")
+    error_count = 0
+    success_count = 0
+    error_types = collections.Counter()
+    last_log_time = time.time()
+    
+    with wds.ShardWriter(shards_pattern, maxcount=MAX_SAMPLES_PER_SHARD) as sink:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Create a wds pipeline for each shard to better track progress
+            shard_pbar = tqdm(input_shards, desc="Overall Shard Progress", unit="shard")
+            for shard_path in shard_pbar:
+                shard_name = os.path.basename(shard_path)
+                shard_pbar.set_postfix_str(f"Processing {shard_name}")
+
+                # Create a dataset for the current shard
+                shard_dataset = wds.WebDataset(shard_path)
+                
+                # Submit jobs for the current shard
+                future_to_key = {
+                    executor.submit(process_and_encode_sample, sample, model, image_preprocessor, tokenizer, device): sample['__key__']
+                    for sample in shard_dataset
+                }
+
+                # Process results as they complete
+                for future in as_completed(future_to_key):
+                    result, error_msg = future.result()
+                    if result is not None:
+                        sink.write(result)
+                        success_count += 1
+                    else:
+                        error_count += 1
+                        # Log detailed error and count its type
+                        if error_msg:
+                            error_type = error_msg.split(':')[1].split(' ')[1] if ':' in error_msg else "UnknownError"
+                            error_types[error_type] += 1
+                            logging.debug(error_msg) # Log full error message in debug mode
+                
+                # Performance logging
+                current_time = time.time()
+                if current_time - last_log_time > LOG_INTERVAL_SECONDS:
+                    elapsed = current_time - start_time
+                    graphs_per_sec = success_count / elapsed if elapsed > 0 else 0
+                    logging.info(
+                        f"  -> Progress: {success_count} graphs processed. "
+                        f"Speed: {graphs_per_sec:.2f} graphs/sec. "
+                        f"Errors: {error_count}."
+                    )
+                    last_log_time = current_time
+
+    # --- 3. Final summary ---
+    total_time = time.time() - start_time
+    final_rate = success_count / total_time if total_time > 0 else 0
+    logging.info("\n" + "="*80)
+    logging.info("🏁 Pre-computation Complete!")
+    logging.info(f"  - Output Directory: {OUTPUT_EMBEDDING_DIR}")
+    logging.info(f"  - Successfully Packaged Subgraphs: {success_count}")
+    logging.info(f"  - Subgraphs Skipped due to Errors: {error_count}")
+    if error_count > 0:
+        logging.info("  - Error Type Breakdown:")
+        for err_type, count in error_types.items():
+            logging.info(f"    - {err_type}: {count}")
+    logging.info(f"  - Total Time: {total_time:.2f} seconds ({total_time / 60:.2f} minutes)")
+    logging.info(f"  - Average Throughput: {final_rate:.2f} graphs/sec")
+    logging.info("="*80)
+    logging.info("Next Step: Update your training script's --train-data path to point to the new embedding shards.")
+
+
+if __name__ == '__main__':
+    create_embedding_dataset()
+

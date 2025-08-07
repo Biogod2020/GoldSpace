@@ -1,4 +1,4 @@
-# 文件路径: src/open_clip/spaglam_model.py
+# 文件路径: src/open_clip/spaglam_model.py (版本3 - SOTA重构)
 
 import torch
 import torch.nn as nn
@@ -6,10 +6,14 @@ import torch.nn.functional as F
 from typing import Optional
 
 # 导入 torch_geometric 的核心组件
-from torch_geometric.nn import GATv2Conv
+from torch_geometric.nn import GATv2Conv, TransformerConv
 from torch_geometric.nn.glob import global_mean_pool
 
-# SOTA 组件 1: 一个简化的图Transformer块
+# ==============================================================================
+# ========================      SOTA 组件      ================================
+# ==============================================================================
+
+# --- 组件 1: 你的自定义图Transformer层 (保持不变) ---
 class GraphTransformerLayer(nn.Module):
     """
     一个图Transformer层，通过全局自注意力捕捉长距离依赖。
@@ -35,50 +39,40 @@ class GraphTransformerLayer(nn.Module):
         # 为了让MultiheadAttention只在子图内操作，我们需要一个注意力掩码
         # attn_mask (num_graphs, num_nodes, num_nodes)
         num_nodes = x.size(0)
+        # 创建注意力掩码，确保注意力只在子图内部计算
         attn_mask = torch.eq(batch_index.unsqueeze(1), batch_index.unsqueeze(0)).logical_not()
-        
-        # MultiheadAttention期望的掩码是：True的位置被忽略
-        attn_output, _ = self.attn(
-            x_norm, x_norm, x_norm, 
-            attn_mask=attn_mask,
-            need_weights=False
-        )
+        attn_output, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask, need_weights=False)
         x = x + attn_output
         x = x + self.ffn(self.norm2(x))
         return x
 
-# SOTA 组件 2: 深度模态交互模块
-class DeepModalityInteractionBlock(nn.Module):
-    """
-    通过双向交叉注意力，实现图像和基因模态的深度交互。
-    """
-    def __init__(self, dim: int, num_heads: int):
+# --- 组件 2: 残差连接包装器 (新 SOTA 组件) ---
+# 这个包装器可以为任何GNN层添加残差连接，非常模块化。
+class ResidualGNNWrapper(nn.Module):
+    def __init__(self, gnn_layer: nn.Module):
         super().__init__()
-        self.norm_img = nn.LayerNorm(dim)
-        self.norm_gene = nn.LayerNorm(dim)
-        self.cross_attn_i2g = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.cross_attn_g2i = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        # 门控机制，学习融合权重
-        self.gate_img = nn.Parameter(torch.tensor([0.0]))
-        self.gate_gene = nn.Parameter(torch.tensor([0.0]))
-        self.ffn_img = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
-        self.ffn_gene = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.gnn_layer = gnn_layer
 
-    def forward(self, x_img: torch.Tensor, x_gene: torch.Tensor) -> (torch.Tensor, torch.Tensor):
-        x_img_norm, x_gene_norm = self.norm_img(x_img), self.norm_gene(x_gene)
-        
-        # 基因模态查询图像模态
-        gene_updated, _ = self.cross_attn_i2g(x_gene_norm, x_img_norm, x_img_norm)
-        # 图像模态查询基因模态
-        img_updated, _ = self.cross_attn_g2i(x_img_norm, x_gene_norm, x_gene_norm)
-        
-        # 通过门控残差连接进行融合
-        x_gene = x_gene + torch.sigmoid(self.gate_gene) * self.ffn_gene(gene_updated)
-        x_img = x_img + torch.sigmoid(self.gate_img) * self.ffn_img(img_updated)
-        
-        return x_img, x_gene
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # 残差连接的核心：输入 + GNN层的输出
+        # 使用 *args 和 **kwargs 确保它可以包装任何类型的GNN层
+        return x + self.gnn_layer(x, *args, **kwargs)
 
-# SOTA 组件 3: 非线性投影头
+# --- 组件 3: GNN层工厂 (新 SOTA 组件) ---
+# 这个函数根据配置创建正确的GNN层，使主模型代码更清晰。
+def create_gnn_layer(config: object, in_dim: int, out_dim: int) -> nn.Module:
+    gnn_type = config.gnn_type.lower()
+    if gnn_type == 'gat':
+        return GATv2Conv(in_dim, out_dim, heads=config.gnn_heads, concat=False, dropout=0.1)
+    elif gnn_type == 'graphtransformer':
+        return GraphTransformerLayer(in_dim, num_heads=config.gnn_heads)
+    elif gnn_type == 'transformerconv':
+        # TransformerConv 是一个更强大的、基于真实图拓扑的注意力层
+        return TransformerConv(in_dim, out_dim, heads=config.gnn_heads, concat=False, dropout=0.1)
+    else:
+        raise ValueError(f"Unsupported GNN type: '{config.gnn_type}'")
+
+# --- 组件 4: 非线性投影头 (保持不变) ---
 class MLPProjectionHead(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
@@ -88,31 +82,17 @@ class MLPProjectionHead(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, output_dim)
         )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-# --- 主模型：SpaGLaM ---
-# src/open_clip/spaglam_model.py
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
-from torch_geometric.nn import GATv2Conv
-from torch_geometric.nn.glob import global_mean_pool
-
-# ... (GraphTransformerLayer, DeepModalityInteractionBlock, MLPProjectionHead classes remain unchanged) ...
-
-# --- 主模型：SpaGLaM (CORRECTED) ---
+# ==============================================================================
+# ========================      主模型: SpaGLaM      ===========================
+# ==============================================================================
 class SpaGLaM(nn.Module):
     def __init__(self, open_clip_model: nn.Module, config: object):
         super().__init__()
         self.config = config
         self.omiclip_model = open_clip_model
-
-        # 【修复】: 统一属性名，直接使用 'use_precomputed_embeddings'。
-        # 这个属性将作为训练时的默认行为。
         self.use_precomputed_embeddings = getattr(config, 'use_precomputed_embeddings', False)
         
         # 冻结策略
@@ -121,89 +101,77 @@ class SpaGLaM(nn.Module):
                 param.requires_grad = False
             self.omiclip_model.eval()
 
-        # 获取维度信息
+        # 动态获取维度信息
         if hasattr(self.omiclip_model.visual, 'proj') and self.omiclip_model.visual.proj is not None:
              gnn_output_dim = self.omiclip_model.visual.proj.shape[1]
         else:
              gnn_output_dim = self.omiclip_model.visual.output_dim
-            
         gnn_input_dim = self.omiclip_model.visual.output_dim
         gnn_hidden_dim = config.gnn_hidden_dim
         
-        # 构建并行的GNN塔和交互模块
+        # --- 使用工厂和包装器构建GNN塔 ---
         self.gnn_layers_img = nn.ModuleList()
         self.gnn_layers_gene = nn.ModuleList()
         self.interaction_layers = nn.ModuleList() if config.use_deep_fusion else None
         
         current_dim = gnn_input_dim
         for _ in range(config.gnn_layers):
-            if config.gnn_type == 'gat':
-                self.gnn_layers_img.append(GATv2Conv(current_dim, gnn_hidden_dim, heads=config.gnn_heads, concat=False, dropout=0.1))
-                self.gnn_layers_gene.append(GATv2Conv(current_dim, gnn_hidden_dim, heads=config.gnn_heads, concat=False, dropout=0.1))
-            elif config.gnn_type == 'graphtransformer':
-                self.gnn_layers_img.append(GraphTransformerLayer(current_dim, num_heads=config.gnn_heads))
-                self.gnn_layers_gene.append(GraphTransformerLayer(current_dim, num_heads=config.gnn_heads))
-            else:
-                raise ValueError(f"Unknown GNN type: {config.gnn_type}")
+            # 1. 从工厂创建基础GNN层
+            img_layer = create_gnn_layer(config, current_dim, gnn_hidden_dim)
+            gene_layer = create_gnn_layer(config, current_dim, gnn_hidden_dim)
             
-            if self.interaction_layers is not None:
-                self.interaction_layers.append(DeepModalityInteractionBlock(gnn_hidden_dim, num_heads=config.gnn_heads))
+            # 2. 如果配置需要，则用残差连接包装它
+            if getattr(config, 'use_residual_connection', False):
+                img_layer = ResidualGNNWrapper(img_layer)
+                gene_layer = ResidualGNNWrapper(gene_layer)
             
+            self.gnn_layers_img.append(img_layer)
+            self.gnn_layers_gene.append(gene_layer)
             current_dim = gnn_hidden_dim
         
         self.image_proj_head = MLPProjectionHead(gnn_hidden_dim, gnn_hidden_dim, gnn_output_dim)
         self.gene_proj_head = MLPProjectionHead(gnn_hidden_dim, gnn_hidden_dim, gnn_output_dim)
         self.logit_scale = self.omiclip_model.logit_scale
 
-    def forward(self, batch: "torch_geometric.data.Batch", use_encoder: Optional[bool] = None) -> dict:
-        """
-        SpaGLaM 的前向传播。
-        """
-        # 决定当前前向传播的模式
-        if use_encoder is None:
-            # 【修复】: 直接引用统一后的属性名 self.use_precomputed_embeddings
-            should_encode = not self.use_precomputed_embeddings
-        else:
-            should_encode = use_encoder
-
-        # 1. 初始特征提取
-        if should_encode:
-            # 模式 A: 实时编码 (用于推理或原始数据训练)
-            # 在推理时，即使 freeze_omiclip=True, 也不应该计算梯度
-            is_training_and_not_frozen = self.training and not self.config.freeze_omiclip
-            with torch.set_grad_enabled(is_training_and_not_frozen):
+    def forward(self, batch: "torch_geometric.data.Batch") -> dict:
+        # 1. 初始特征提取 (与原来一致)
+        if self.training and not self.use_precomputed_embeddings:
+            with torch.set_grad_enabled(not self.config.freeze_omiclip):
                 E_image = self.omiclip_model.encode_image(batch.x_image)
                 E_gene = self.omiclip_model.encode_text(batch.x_text)
-        else:
-            # 模式 B: 直接使用预计算的 embeddings (用于高效训练)
-            E_image = batch.x_image
-            E_gene = batch.x_text
+        elif self.use_precomputed_embeddings:
+            E_image, E_gene = batch.x_image, batch.x_text
+        else: # Eval mode with raw data
+            with torch.no_grad():
+                E_image = self.omiclip_model.encode_image(batch.x_image)
+                E_gene = self.omiclip_model.encode_text(batch.x_text)
 
-        # 2. GNN传播与深度融合
+        # 2. GNN传播
         img_feat, gene_feat = E_image, E_gene
         for i in range(self.config.gnn_layers):
-            if self.config.gnn_type == 'graphtransformer':
-                img_feat = self.gnn_layers_img[i](img_feat, batch.batch)
-                gene_feat = self.gnn_layers_gene[i](gene_feat, batch.batch)
-            else: # GAT
+            # 根据GNN类型传递不同参数
+            if self.config.gnn_type in ['gat', 'transformerconv']:
+                # GAT和TransformerConv都需要edge_index
                 img_feat = self.gnn_layers_img[i](img_feat, batch.edge_index)
                 gene_feat = self.gnn_layers_gene[i](gene_feat, batch.edge_index)
+            else: # 你的自定义GraphTransformer
+                # 它需要batch_index来进行掩码
+                img_feat = self.gnn_layers_img[i](img_feat, batch.batch)
+                gene_feat = self.gnn_layers_gene[i](gene_feat, batch.batch)
             
+            # 激活函数
             img_feat = F.gelu(img_feat)
             gene_feat = F.gelu(gene_feat)
 
             if self.interaction_layers is not None:
                 img_feat, gene_feat = self.interaction_layers[i](img_feat, gene_feat)
         
-        # 3. 读出 (Readout)
+        # 3. 读出 (Readout) 和 投影 (与原来一致)
         Z_image = global_mean_pool(img_feat, batch.batch)
         Z_gene = global_mean_pool(gene_feat, batch.batch)
-
-        # 4. 投影
         final_image_features = self.image_proj_head(Z_image)
         final_text_features = self.gene_proj_head(Z_gene)
 
-        # 5. 返回
         return {
             "image_features": F.normalize(final_image_features, dim=-1),
             "text_features": F.normalize(final_text_features, dim=-1),

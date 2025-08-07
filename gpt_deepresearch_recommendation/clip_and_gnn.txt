@@ -1,0 +1,58 @@
+Excellent. I’ll conduct a thorough literature review and SOTA analysis of hybrid models combining CLIP-like dual encoders with Graph Neural Networks (GNNs), including both peer-reviewed and preprint works. I’ll prioritize those with zero-shot or few-shot performance, especially in domains such as computational biology, computer vision, and knowledge graphs, with relevance to spatial omics. I’ll also extract actionable architectural recommendations for your SpaGLaM model.
+
+I’ll let you know as soon as the results are ready.
+
+
+# Hybrid CLIP+GNN Architectures: Prior Work
+
+* **Open-Vocabulary 3D Scene Graphs (CCL-3DSGG)**: Chen et al. (CVPR 2024) align CLIP’s text and image encoders to train a 3D scene‐graph extractor.  They freeze CLIP’s image/text backbones and use contrastive losses to align parsed scene captions and multi-view images with a GNN-based 3D scene graph encoder.  Readout is per-node (object/predicate) classification.  This hybrid outperforms prior 3DSGG baselines by large margins (e.g. +9.8% in supervised and +104.4% in unsupervised settings), showing that CLIP supervision greatly boosts GNN training.
+
+* **Hierarchical Image Classification (HGCLIP)**: Xia et al. (ECCV 2024) build a “hierarchy-enhanced CLIP” by injecting graph structure among class labels.  They add learnable prompts to CLIP’s visual and text transformers, then construct the WordNet hierarchy as a graph whose nodes are CLIP-encoded class embeddings.  A graph encoder (a GNN or Graph Transformer) refines these label embeddings with parent/child context.  Image prototypes are similarly passed through the graph.  Readout is still CLIP-style (cosine similarity between an image and its (refined) text embedding).  HGCLIP achieved state-of-the-art accuracy on 11 hierarchical benchmarks, dramatically beating CLIP (e.g. CLIP 66.6%→HGCLIP 91.9% on CIFAR-100 with hierarchy).  Its innovations – deep prompts and prototype-based graph pooling – effectively embed hierarchy without full fine-tuning.
+
+* **Multimodal Knowledge Graph Reasoning (MR-MKG)**: Lee et al. (arXiv 2024) propose a “relation GAT” over a multimodal KG.  They use CLIP’s image encoder (with a linear adapter) to embed visual nodes and CLIP’s text encoder (or LLM) to embed language nodes.  These initial embeddings feed into a Relational GAT that propagates multimodal context across the graph.  Readout is answering multimodal QA.  Using only ≈2.3% of LLM parameters, MR-MKG outperforms previous multimodal KG and VLP baselines on QA and analogical reasoning by leveraging rich graph structure.  (CLIP here is frozen and only used to “prime” node embeddings.)
+
+* **Art Classification with Knowledge Graph (GraphCLIP)**: Scaringi et al. (KBS 2025) introduce “GraphCLIP” for fine-art image classification.  They replace CLIP’s text encoder with a GNN over an art knowledge graph (nodes: styles/genres/artists, edges: relations) to provide contextual labels.  The image encoder is CLIP (frozen), and the graph encoder is a GNN that embeds the label-KG.  During training, image embeddings are contrastively aligned with graph-node embeddings.  The readout pools the GNN (e.g. averaging or \[CLS]-like token) to produce a class embedding.  GraphCLIP “combines visual data with contextual knowledge” and achieves SOTA on the ArtGraph dataset.  It is notably robust to unseen classes under distribution shift (zero-shot artists/styles), far outperforming a vanilla CLIP (image‐only) baseline.
+
+* **Text-Attributed Graphs (GraphCLIP TAG)**: Pan et al. (ICML 2024) propose GraphCLIP for graphs with rich text annotations.  They use an LLM (Qwen-72B) to generate natural-language “summaries” of subgraphs, then train a CLIP-style model: a GNN encodes the graph and a language model encodes its summary.  A contrastive loss aligns graph features with text summary features.  No labels are used – after pretraining, the model can do zero-shot node/graph classification.  GraphCLIP achieves “strong zero-shot performance” across tasks and “outperforms previous SOTA” in few-shot settings, showing effective cross-domain transfer.
+
+* **Cybersecurity Traffic (PacketCLIP)**: Masukawa et al. (ArXiv 2025) design PacketCLIP to classify encrypted network flows.  They treat raw packet metadata as one modality and human-readable descriptions of attacks as another, training a CLIP-like encoder to align them via contrastive learning.  The resulting joint embeddings feed into a hierarchical GNN built on an LLM-generated knowledge graph of cyberattack stages.  PacketCLIP’s pipeline (text encoder + “packet” encoder → hierarchical GNN) achieves \~95% AUC on encrypted traffic anomaly detection, beating baselines by 11.6%.  (CLIP here inspires the contrastive pretraining; the GNN “hierarchical reasoning” adds semantic context.)
+
+**Integration Patterns:** In most hybrids, the CLIP or CLIP-style encoders are used *first* to compute node/patch embeddings, and are **frozen** during GNN training.  The GNN (typically GAT or a Graph Transformer) then refines or propagates those embeddings on a graph (scene-graph, class-graph, spatial graph, etc.).  Readouts vary by task: some use only node features (e.g. classifying a central node), others pool whole-graph features (e.g. using a \[CLS] node or mean pooling).  For example, the 3DSG model computes per-node (object/predicate) cosine similarities, GraphCLIP (art) pools over node embeddings of the art-knowledge graph, and HGCLIP uses class-level prototype nodes with attention.
+
+# Performance and Technical Insights
+
+* **Improvement over CLIP-only:**  Hybrid models generally beat CLIP alone.  CCL-3DSGG vastly outperforms prior 3D scene-graph baselines (no CLIP) by \~10–100%.  GraphCLIP variants and PacketCLIP similarly report large gains (e.g. GraphCLIP-text >10% node accuracy; PacketCLIP +11.6% AUC).  HGCLIP’s graph component yields \~20+ point boosts in hierarchical classification vs. CLIP prompts.  These gains show that spatial or relational context can significantly refine CLIP’s powerful features when done correctly.
+
+* **Key innovations:**  Many models use **contrastive or prompt-based alignment** to leverage CLIP’s strengths.  CCL-3DSGG aligns CLIP’s image/text outputs with graph features via dual contrastive losses.  MR-MKG uses a CLIP adapter to “seed” node embeddings before a relational-GNN.  GraphCLIP(TAG) exploits LLM-generated text and contrastive pretraining to tie graphs to language.  Prompt tuning and hierarchical prototypes (HGCLIP) let graph structure shape CLIP’s embedding space.  Notably, replacing CLIP’s text side with a GNN (as in Art-GraphCLIP) injects domain knowledge.
+
+* **Mitigating oversmoothing:**  Most hybrids do not explicitly discuss oversmoothing, but they employ indirect measures.  For example, HGCLIP uses *prototype pooling* rather than deep GNN layers to add hierarchy.  PacketCLIP’s “hierarchical” GNN likely limits depth.  CCL-3DSGG uses multi-view negatives to preserve feature distinctness.  Some papers hint at residual/fusion connections (PointCLIP uses residual adapters to merge 3D info into CLIP, a technique readily adaptable).  In practice, advanced GNN designs (graph Transformers, gating, normalization) are recommended to avoid feature collapse.
+
+* **Readout and pooling:**  Approaches vary.  Many use *global pooling* or \[CLS]-like tokens on graph outputs.  HGCLIP creates class prototypes and uses attention (akin to pooling) to fuse GNN outputs.  GraphCLIP(TAG) and PacketCLIP effectively do link/node classification directly from node embeddings.  The choice depends on task granularity (node vs. graph labels).
+
+# Spatial Omics and Biology Applications
+
+Beyond tissue annotation, hybrid CLIP+GNN models could address key spatial-omics problems:
+
+* **Cell–cell interaction prediction:**  Identify likely ligand–receptor (L–R) interactions between nearby spots.  For example, spatial-omics studies have found specific L–R pairs (e.g. C5AR1–RPS19 between tumor and stroma) driving local crosstalk.  A CLIP+GNN could predict such intercellular links from image+transcript features.
+
+* **TME niche identification:**  Discover functionally distinct microenvironments.  For instance, high TMSB4X vs. high VIM expression demarcated tumor vs. stromal niches in colorectal cancer.  A graph model could refine OmiCLIP features to better separate these spatial domains.
+
+* **Patient stratification / outcome:**  Aggregate spatial patterns to predict clinical labels.  Integrating spatial transcriptomics with single-cell data has revealed patient subgroups with distinct immune evasion.  A GNN on patient-specific spot graphs (with CLIP features) could learn such signatures for prognosis or therapy response.
+
+* **Cross-modality alignment:**  Align different spatial measurements.  For example, matching MERFISH/protein spots to histology or to Visium data.  CLIP+GNN could fuse modalities via a shared graph.
+
+* **Gene expression or cell-type deconvolution:**  Use histology features to predict local gene expression (OmiCLIP’s Loki already does this) or to infer cell-type compositions from spot graphs.  A spatial GNN could propagate image-informed embeddings to impute missing molecular data.
+
+* **Spatial pattern clustering:**  Refine unsupervised spot clustering by context.  Beyond ARI/NMI for tissue labels, one could cluster based on graph-augmented embeddings to reveal, e.g. tumor subregions or immune niches.
+
+# Recommendations for SpaGLaM
+
+* **Residual/Gated fusion:**  Add a *residual adapter* so that the GNN-refined node embedding is **added to** (or gated with) the original CLIP feature, instead of replacing it.  For example, PointCLIP uses a lightweight residual-style MLP to fuse new 3D information with CLIP features.  A similar gated residual block (or GRU-like gating) would preserve OmiCLIP’s strong embeddings and let the GNN make only complementary adjustments.
+
+* **Hierarchical pooling/prototypes:**  Incorporate multi-scale pooling to capture global context without oversmoothing.  Self-attention graph pooling (SAGPool) is one option – it computes attention scores over nodes (using the graph Laplacian) to select salient nodes hierarchically.  Alternatively, mirror HGCLIP’s idea: learn “class prototype” embeddings (e.g. cluster centers of spots) and pass those through the GNN, then re-infuse them into spot features.  This lets the model reason at a coarser level and can stabilize training.
+
+* **Graph Transformer or normalization:**  Consider using a Graph Transformer (e.g. Graphormer) instead of plain GAT/GNN.  Graphormer layers use attention with explicit structural encodings, plus layer norm and skip connections, which are empirically less prone to oversmoothing.  If a full transformer is heavy, at least add skip-connections or PairNorm to your GNN.
+
+* **Benchmark task:**  To test spatial reasoning, go beyond ARI/NMI on clustering.  For example, evaluate the model’s ability to predict cell–cell ligand–receptor interactions: construct a held-out set of known L–R links between neighboring spots and measure AUC/F1 for detecting them.  Alternatively, define microenvironment “niches” (e.g. tumor vs. stroma zones) and test classification accuracy.  These tasks explicitly rely on spatial context; success on them would demonstrate that the GNN is truly leveraging neighborhood information (as opposed to just replicating OmiCLIP’s single-spot cues).
+
+**Sources:** Examples and findings above are drawn from recent CLIP+GNN studies and relevant biological reports.
