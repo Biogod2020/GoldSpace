@@ -514,7 +514,7 @@ def parse_args(args):
         "--gnn-type",
         type=str,
         default="gat",
-        choices=["gat", "graphtransformer"],
+        choices=["gat", "graphtransformer", "transformerconv"],
         help="Type of GNN backbone to use."
     )
     parser.add_argument(
