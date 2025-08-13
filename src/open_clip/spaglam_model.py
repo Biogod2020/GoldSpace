@@ -129,6 +129,8 @@ class SpaGLaM(nn.Module):
         self.gene_proj_head = MLPProjectionHead(gnn_hidden_dim, gnn_hidden_dim, gnn_output_dim)
         self.logit_scale = self.omiclip_model.logit_scale
 
+# 文件路径: src/open_clip/spaglam_model.py
+
     def forward_gnn(self, batch: "torch_geometric.data.Batch") -> (torch.Tensor, torch.Tensor):
         """
         Runs the GNN part of the model and returns node-level features before pooling.
@@ -140,16 +142,24 @@ class SpaGLaM(nn.Module):
                 E_image = self.omiclip_model.encode_image(batch.x_image)
                 E_gene = self.omiclip_model.encode_text(batch.x_text)
         elif self.use_precomputed_embeddings:
-            E_image, E_gene = batch.x_image, batch.x_text
+            # SOTA 核心修复：安全地获取输入特征
+            # E_image 必须存在
+            E_image = batch.x_image
+            # E_gene 是可选的。如果不存在，创建一个兼容的零张量作为占位符。
+            # 这使得模型在只有图像输入的推理场景下也能正常工作。
+            E_gene = getattr(batch, 'x_text', torch.zeros_like(E_image))
         else: # Eval mode with raw data
             with torch.no_grad():
                 E_image = self.omiclip_model.encode_image(batch.x_image)
-                E_gene = self.omiclip_model.encode_text(batch.x_text)
+                # 同样地，安全处理 x_text
+                if hasattr(batch, 'x_text'):
+                    E_gene = self.omiclip_model.encode_text(batch.x_text)
+                else:
+                    E_gene = torch.zeros_like(E_image)
 
-        # 2. GNN传播
+        # 2. GNN传播 (这部分代码保持不变)
         img_feat, gene_feat = E_image, E_gene
         for i in range(self.config.gnn_layers):
-            # 根据GNN类型传递不同参数
             if self.config.gnn_type in ['gat', 'transformerconv']:
                 img_feat = self.gnn_layers_img[i](img_feat, batch.edge_index)
                 gene_feat = self.gnn_layers_gene[i](gene_feat, batch.edge_index)
