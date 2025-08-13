@@ -11723,10 +11723,6 @@ except ImportError:
     openslide = None
 
 # squidpy is an optional dependency for reading from AnnData
-try:
-    from squidpy.im import ImageContainer
-except ImportError:
-    ImageContainer = None
 
 
 class ImageHandler:
@@ -11823,9 +11819,7 @@ class ImageHandler:
         
         if openslide and isinstance(self.image_obj, openslide.OpenSlide):
             region = self.image_obj.read_region((read_left, read_top), 0, (read_width, read_height)).convert("RGB")
-        elif ImageContainer and isinstance(self.image_obj, ImageContainer):
-            region_np = self.image_obj.crop_corner(read_left, read_top, size_x=read_width, size_y=read_height).data
-            region = Image.fromarray(region_np).convert("RGB")
+
         elif isinstance(self.image_obj, Image.Image):
             region = self.image_obj.crop((read_left, read_top, read_right, read_bottom))
         else:
