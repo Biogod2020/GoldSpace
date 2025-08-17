@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # merged_output.py 为最终合并文件名，可自行修改
-output="merged_output_aug_8.txt"
+output="spaglam_aug_18.txt"
 # 如果已有旧的合并文件，先删除
 rm -f "$output"
 

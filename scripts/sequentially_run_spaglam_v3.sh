@@ -34,6 +34,8 @@ TEST_NUM_SAMPLES=200000
 
 # --- 3. 通用训练参数 (移除deep fusion) ---
 COMMON_ARGS=" \
+  --gnn-mode            image_only \
+  --text-pooler         center" \
   --model               ViT-B-32 \
   --pretrained          \"${BASE_MODEL_PATH}\" \
   --dataset-type        spaglam \
