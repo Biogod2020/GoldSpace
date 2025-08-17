@@ -113,6 +113,14 @@ class SpaGLaM(nn.Module):
         self.gnn_layers_img = nn.ModuleList()
         self.gnn_layers_gene = nn.ModuleList()
         self.interaction_layers = nn.ModuleList() if config.use_deep_fusion else None
+        # 冻结未使用分支，避免 DDP 期待这些参数参与梯度归约
+        mode = getattr(config, "gnn_mode", "dual")
+        if mode == "image_only":
+            for p in self.gnn_layers_gene.parameters():
+                p.requires_grad = False
+        elif mode == "text_only":
+            for p in self.gnn_layers_img.parameters():
+                p.requires_grad = False
         
         current_dim = gnn_input_dim
         for _ in range(config.gnn_layers):
