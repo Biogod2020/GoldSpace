@@ -525,7 +525,7 @@ def parse_args(args):
         default="mean",
         help="When text GNN is disabled, 'center' picks the center-spot node embedding."
     )
-parser.add_argument(
+    parser.add_argument(
         "--gnn-type",
         type=str,
         default="gat",
