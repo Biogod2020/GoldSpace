@@ -29,29 +29,7 @@ class GraphTransformerLayer(nn.Module):
             nn.Linear(dim * ffn_expansion, dim)
         )
 
-    @staticmethod
-    def _select_centers(x_nodes: torch.Tensor, batch) -> torch.Tensor:
-        """为每个子图选出一个中心节点的特征，返回 [G, C]。优先使用 batch.center_mask；否则用 ptr 或 batch 边界。"""
-        N = x_nodes.size(0)
-        device = x_nodes.device
-        if hasattr(batch, "center_mask") and batch.center_mask is not None:
-            mask = batch.center_mask
-            assert mask.dtype == torch.bool and mask.numel() == N, "center_mask 必须是 [N] 的 bool"
-            idx = torch.nonzero(mask, as_tuple=False).view(-1)
-            return x_nodes[idx]
-        if hasattr(batch, "ptr") and batch.ptr is not None:
-            starts = batch.ptr[:-1]
-            return x_nodes[starts]
-        assert hasattr(batch, "batch"), "需要 batch.batch 或 ptr 才能定位子图"
-        graph_ids: torch.Tensor = batch.batch
-        starts = []
-        prev = -1
-        for i in range(N):
-            g = int(graph_ids[i].item())
-            if g != prev:
-                starts.append(i); prev = g
-        starts = torch.tensor(starts, device=device, dtype=torch.long)
-        return x_nodes[starts]
+   
 
     def forward(self, x: torch.Tensor, batch_index: torch.Tensor) -> torch.Tensor:
         # 虽然是全局注意力，但只在每个子图内部进行，以避免信息在不同样本间泄露
@@ -155,7 +133,30 @@ class SpaGLaM(nn.Module):
         self.gene_proj_head  = MLPProjectionHead(txt_proj_in,  gnn_hidden_dim, gnn_output_dim)
         self.logit_scale = self.omiclip_model.logit_scale
 
-# 文件路径: src/open_clip/spaglam_model.py
+
+    @staticmethod
+    def _select_centers(x_nodes: torch.Tensor, batch) -> torch.Tensor:
+        """为每个子图选出一个中心节点的特征，返回 [G, C]。优先使用 batch.center_mask；否则用 ptr 或 batch 边界。"""
+        N = x_nodes.size(0)
+        device = x_nodes.device
+        if hasattr(batch, "center_mask") and batch.center_mask is not None:
+            mask = batch.center_mask
+            assert mask.dtype == torch.bool and mask.numel() == N, "center_mask 必须是 [N] 的 bool"
+            idx = torch.nonzero(mask, as_tuple=False).view(-1)
+            return x_nodes[idx]
+        if hasattr(batch, "ptr") and batch.ptr is not None:
+            starts = batch.ptr[:-1]
+            return x_nodes[starts]
+        assert hasattr(batch, "batch"), "需要 batch.batch 或 ptr 才能定位子图"
+        graph_ids: torch.Tensor = batch.batch
+        starts = []
+        prev = -1
+        for i in range(N):
+            g = int(graph_ids[i].item())
+            if g != prev:
+                starts.append(i); prev = g
+        starts = torch.tensor(starts, device=device, dtype=torch.long)
+        return x_nodes[starts]
 
     def forward_gnn(self, batch: "torch_geometric.data.Batch") -> (torch.Tensor, torch.Tensor):
         """
