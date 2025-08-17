@@ -1,0 +1,992 @@
+# -*- coding: utf-8 -*-
+# =========================================================
+# 0. IMPORTS & ENVIRONMENT SETUP
+# =========================================================
+import os
+import sys
+from pathlib import Path
+from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+from typing import Dict, List
+
+# --- Core Scientific Libraries ---
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import anndata
+import scanpy as sc
+from scipy.sparse import csr_matrix
+
+# --- Graph Computing Library ---
+from torch_geometric.data import Data
+from torch_geometric.utils import from_scipy_sparse_matrix
+
+# --- Visualization ---
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from tqdm.notebook import tqdm
+
+# --- Local Project Imports ---
+# This ensures we are using the local, development version of open_clip
+# and not a potentially conflicting version installed via pip.
+project_root = '/home1/jijh/diffusion_project/git_repo/GoldSpace'
+if project_root not in sys.path:
+    print(f"Adding project root to Python path: {project_root}")
+    sys.path.append(project_root)
+
+# Import our custom modules
+import src.open_clip as open_clip
+from src.spaglam_preproc.utils.hest_loading import HESTDataset, HESTSample
+
+# Set a consistent plotting style for Scanpy
+sc.settings.set_figure_params(dpi=150, frameon=False, facecolor='white')
+
+print("✅ All libraries and project modules imported successfully.")
+# =========================================================
+# 1. GLOBAL CONFIGURATION
+# =========================================================
+# --- Hardware Configuration ---
+# List of CUDA devices to be used for parallel model inference.
+# The analysis will distribute experiments across these devices.
+AVAILABLE_DEVICES = ["cuda:0", "cuda:1", "cuda:2"]
+
+# --- Path Configuration ---
+# Base directory for the HEST dataset.
+HEST_DATA_DIR = "/cwStorage/nodecw_group/jijh/hest_1k"
+
+# Root directory containing the trained SpaGLaM models.
+# The `discover_experiments` function will scan this directory.
+EXPERIMENTS_ROOT_DIR = "/cwStorage/nodecw_group/jijh/trained_models/SpaGLaM_2Hops_test_trainlog"
+
+# Path to the foundational OmiCLIP model checkpoint. This is used for
+# the baseline comparison and as the frozen backbone for SpaGLaM models.
+YOUR_OMICLIP_CHECKPOINT = "/cwStorage/nodecw_group/jijh/training_log/cfff_train/openclip_train/train_log/finetune_20250623-092915/2025_06_23-09_30_48-model_ViT-B-32-lr_2e-05-b_1800-j_16-p_amp_bfloat16/checkpoints/epoch_25.pt"
+
+# --- Model Architecture ---
+# The base vision transformer architecture used by OmiCLIP and SpaGLaM.
+BASE_MODEL_NAME = "ViT-B-32"
+
+print(f"Configuration Loaded:")
+print(f"  - Using Devices: {AVAILABLE_DEVICES}")
+print(f"  - HEST Data Path: {HEST_DATA_DIR}")
+print(f"  - Experiments Path: {EXPERIMENTS_ROOT_DIR}")
+print(f"  - OmiCLIP Checkpoint: .../{Path(YOUR_OMICLIP_CHECKPOINT).name}")
+print(f"  - Base Model Arch: {BASE_MODEL_NAME}")
+# =========================================================
+# 2. CORE UTILITY FUNCTIONS
+# =========================================================
+
+def find_latest_checkpoint(exp_dir: Path) -> str | None:
+    """
+    Intelligently finds the most relevant model checkpoint in an experiment directory.
+    It prioritizes specific epoch checkpoints (e.g., epoch_45.pt) and 'epoch_latest.pt',
+    falling back to the numerically highest epoch number if those are not found.
+    
+    Args:
+        exp_dir: The Path object for the experiment directory.
+
+    Returns:
+        The path to the checkpoint file as a string, or None if no checkpoint is found.
+    """
+    ckpt_dir = exp_dir / "checkpoints"
+    if not ckpt_dir.exists():
+        return None
+    # Prioritized checkpoint names
+    for name in ["epoch_45.pt", "epoch_latest.pt"]:
+        p = ckpt_dir / name
+        if p.exists(): return str(p)
+    # Fallback to the last saved epoch
+    cks = sorted(ckpt_dir.glob("epoch_*.pt"))
+    return str(cks[-1]) if cks else None
+
+def parse_params_txt(params_path: Path) -> dict:
+    """
+    Parses the 'params.txt' file generated during training to extract key
+    hyperparameters of the SpaGLaM model. This allows us to load model
+    configurations dynamically without hardcoding them.
+
+    Args:
+        params_path: Path to the params.txt file.
+
+    Returns:
+        A dictionary containing the parsed hyperparameters.
+    """
+    if not params_path.exists():
+        print(f"Warning: params.txt not found at {params_path}")
+        return {}
+    cfg = {}
+    for line in params_path.read_text().splitlines():
+        if ':' in line:
+            k, v = line.split(':', 1)
+            cfg[k.strip()] = v.strip()
+    # Type-cast the parsed string values to their correct types
+    return {
+        'gnn_type': cfg.get('gnn_type', 'gat'),
+        'gnn_layers': int(cfg.get('gnn_layers', 2)),
+        'gnn_heads': int(cfg.get('gnn_heads', 8)),
+        'gnn_hidden_dim': int(cfg.get('gnn_hidden_dim', 512)),
+        'use_deep_fusion': cfg.get('use_deep_fusion', 'False') == 'True',
+        'use_residual_connection': cfg.get('use_residual_connection', 'False') == 'True',
+    }
+
+def discover_experiments(root_dir: str) -> List[dict]:
+    """
+    Scans the root experiments directory to automatically discover all valid,
+    trained SpaGLaM model variants.
+
+    Args:
+        root_dir: The root directory containing individual experiment folders.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents one experiment
+        with its name, checkpoint path, and hyperparameters.
+    """
+    exps = []
+    for exp_name in os.listdir(root_dir):
+        exp_dir = Path(root_dir) / exp_name
+        if not exp_dir.is_dir():
+            continue
+        ckpt = find_latest_checkpoint(exp_dir)
+        if ckpt is None:
+            continue
+        params = parse_params_txt(exp_dir / "params.txt")
+        d = {
+            "name": exp_name,
+            "path": ckpt,
+            "base_model_name": BASE_MODEL_NAME,
+            "is_baseline": False,
+        }
+        d.update(params)
+        exps.append(d)
+    return exps
+    
+def precompute_omiclip_embeddings(
+    adata: anndata.AnnData, 
+    wsi: HESTSample, 
+    checkpoint_path: str,
+    device: str, 
+    batch_size: int = 512, 
+    num_workers: int = 32
+) -> torch.Tensor:
+    """
+    A high-performance function to extract OmiCLIP image features for every spot.
+    It uses a custom PyTorch Dataset and DataLoader for efficient, parallelized
+    tile extraction and GPU-based inference.
+
+    Args:
+        adata: The AnnData object containing spatial coordinates.
+        wsi: The OpenSlide WSI object.
+        checkpoint_path: Path to the OmiCLIP model checkpoint.
+        device: The CUDA device to use for inference (e.g., 'cuda:0').
+        batch_size: Number of image tiles to process in one go.
+        num_workers: Number of CPU processes for data loading.
+
+    Returns:
+        A CPU tensor of shape (n_spots, embedding_dim) containing the
+        L2-normalized image features for each spot.
+    """
+    # 1. Load the OmiCLIP model
+    base_model, _, image_preprocessor = open_clip.create_model_and_transforms(
+        BASE_MODEL_NAME, pretrained=None
+    )
+    sd = torch.load(checkpoint_path, map_location='cpu')['state_dict']
+    sd = {k.replace('module.', ''): v for k, v in sd.items()} # Handle DDP prefix
+    base_model.load_state_dict(sd, strict=False)
+    base_model.to(device).eval()
+
+    # 2. Define a custom Dataset for on-the-fly tile extraction
+    class WSISpotDataset(torch.utils.data.Dataset):
+        def __init__(self, wsi, coords, transform=None):
+            self.wsi = wsi
+            self.coords = np.asarray(coords)
+            self.transform = transform
+            self.patch_size = (224, 224)
+            self.patch_radius = self.patch_size[0] // 2
+        def __len__(self): return len(self.coords)
+        def __getitem__(self, idx):
+            c = self.coords[idx]
+            top_left = (int(c[0] - self.patch_radius), int(c[1] - self.patch_radius))
+            # Extract tile from the highest resolution level (level 0)
+            tile = self.wsi.read_region(top_left, 0, self.patch_size).convert("RGB")
+            if self.transform:
+                tile = self.transform(tile)
+            return tile
+
+    # 3. Create DataLoader for parallel processing
+    ds = WSISpotDataset(wsi, adata.obsm['spatial'], image_preprocessor)
+    dl = torch.utils.data.DataLoader(
+        ds, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True, drop_last=False
+    )
+
+    # 4. Run inference and collect features
+    all_spot_features = []
+    with torch.no_grad():
+        for batch in tqdm(dl, desc="🚀 Encoding spots with OmiCLIP"):
+            batch = batch.to(device, non_blocking=True)
+            # Crucially, `normalize=True` to get unit vectors for cosine similarity
+            features = base_model.encode_image(batch, normalize=True)
+            all_spot_features.append(features.cpu())
+    
+    final_features = torch.cat(all_spot_features, dim=0)
+    
+    # 5. Clean up GPU memory
+    del base_model
+    torch.cuda.empty_cache()
+    return final_features
+
+# =========================================================
+# 修正后的推理函数
+# =========================================================
+def run_experiment_fullgraph(
+    exp_config: dict,
+    device: str,
+    data: Data,
+    text_queries: Dict[str, str],
+    tokenizer
+) -> tuple[str, dict]:
+    """
+    为单个实验在完整的空间图上执行零样本推理。
+    此函数已更新，以正确调用 SpaGLaM 模型的节点级特征提取方法。
+    """
+    torch.cuda.set_device(device)
+    model_device = torch.device(device)
+    print(f"🔬 [{exp_config['name']}] Running full-graph forward pass on {device}")
+
+    # 1. 编码文本查询 (与之前相同)
+    labels = list(text_queries.keys())
+    tokenized_text = tokenizer(list(text_queries.values())).to(model_device)
+
+    # 2. 加载基础 OmiCLIP 模型 (与之前相同)
+    base_model, _, _ = open_clip.create_model_and_transforms(BASE_MODEL_NAME, pretrained=None)
+    omiclip_sd = torch.load(YOUR_OMICLIP_CHECKPOINT, map_location='cpu')['state_dict']
+    omiclip_sd = {k.replace('module.', ''): v for k, v in omiclip_sd.items()}
+    base_model.load_state_dict(omiclip_sd, strict=False)
+    base_model = base_model.to(model_device).eval()
+
+    # 3. 移动图数据到GPU (与之前相同)
+    data_gpu = data.clone().to(model_device)
+
+    with torch.no_grad():
+        text_features = base_model.encode_text(tokenized_text, normalize=True)
+
+        if exp_config['is_baseline']:
+            # 对于基线模型，直接使用预计算的图像特征
+            image_features = data_gpu.x_image
+        else:
+            # 对于 SpaGLaM 模型，实例化并运行GNN
+            
+            # 构造模型配置 (已修复 TypeError)
+            model_params = {
+                'use_precomputed_embeddings': True,
+                'freeze_omiclip': False,
+                **exp_config
+            }
+            model_cfg = Namespace(**model_params)
+            
+            model = open_clip.SpaGLaM(open_clip_model=base_model, config=model_cfg)
+            
+            spaglam_sd = torch.load(exp_config['path'], map_location='cpu')['state_dict']
+            spaglam_sd = {k.replace('module.', ''): v for k, v in spaglam_sd.items()}
+            model.load_state_dict(spaglam_sd)
+            model = model.to(model_device).eval()
+            
+            # =======================  核心修复点  =======================
+            # 1. 检查 'forward_gnn' 方法是否存在，以防内核未重启
+            if not hasattr(model, 'forward_gnn'):
+                # 如果方法不存在，抛出一个信息更明确的错误，指导用户操作
+                raise AttributeError(
+                    "SpaGLaM 模型实例缺少 'forward_gnn' 方法。 "
+                    "请确认您已将该方法添加到 src/open_clip/spaglam_model.py 文件中，"
+                    "并已【重启】Jupyter Notebook 内核以加载最新的代码。"
+                )
+
+            # 2. 调用正确的方法名: forward_gnn
+            node_features_raw, _ = model.forward_gnn(data_gpu)
+            # ===============================================================
+            
+            # 后续处理保持不变
+            node_features_projected = model.image_proj_head(node_features_raw)
+            image_features = F.normalize(node_features_projected, dim=-1)
+
+        # 4. 零样本分类 (与之前相同)
+        logits = image_features @ text_features.T
+        probabilities = F.softmax(logits, dim=1)
+        confidences, predictions = torch.max(probabilities, dim=1)
+        
+        predictions = predictions.cpu().numpy()
+        confidences = confidences.cpu().numpy()
+
+    # 5. 清理GPU内存 (与之前相同)
+    del base_model
+    if not exp_config['is_baseline']:
+        del model
+    torch.cuda.empty_cache()
+
+    # 6. 格式化结果 (与之前相同)
+    return exp_config['name'], {
+        "labels": pd.Series([labels[i] for i in predictions], index=node_idx_to_obs),
+        "confidences": pd.Series(confidences, index=node_idx_to_obs),
+    }
+
+
+def run_all_experiments_fullgraph(
+    experiments: List[dict],
+    data: Data,
+    text_queries: Dict[str, str],
+    tokenizer,
+    devices: List[str]
+) -> Dict[str, dict]:
+    """
+    Orchestrates the parallel execution of multiple experiments across available GPUs.
+
+    Args:
+        experiments: A list of experiment configuration dictionaries.
+        data: The PyG Data object for the sample.
+        text_queries: The text prompts for classification.
+        tokenizer: The CLIP tokenizer.
+        devices: A list of available CUDA device strings.
+
+    Returns:
+        An ordered dictionary mapping experiment names to their results.
+    """
+    all_results = {}
+    # Use functools.partial to pre-fill arguments for the worker function
+    worker_fn = partial(run_experiment_fullgraph, data=data, text_queries=text_queries, tokenizer=tokenizer)
+    
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        # Create a future for each experiment, cycling through devices
+        futures = []
+        for i, exp_cfg in enumerate(experiments):
+            device = devices[i % len(devices)]
+            futures.append(executor.submit(worker_fn, exp_cfg, device))
+        
+        # Collect results as they complete
+        progress_bar = tqdm(as_completed(futures), total=len(futures), desc="📈 Running All Experiments")
+        for future in progress_bar:
+            name, result = future.result()
+            all_results[name] = result
+            
+    # Return results in the original experiment order
+    ordered_results = {exp['name']: all_results[exp['name']] for exp in experiments}
+    return ordered_results
+
+def plot_grid(
+    adata_plot, 
+    exp_names: List[str], 
+    color_suffix: str, 
+    title_prefix: str, 
+    library_id: str, 
+    s=3
+):
+    """
+    Generates a grid of spatial plots for comparing results from multiple experiments.
+    
+    Args:
+        adata_plot: The AnnData object containing the results in .obs.
+        exp_names: List of experiment names to plot.
+        color_suffix: Suffix for the .obs column name to use for coloring.
+        title_prefix: Main title for the entire figure.
+        library_id: The sample's library ID for Scanpy.
+        s: The size of the spots in the plot.
+    """
+    # 1. Define a consistent color palette for all plots
+    all_categories = adata_plot.obs[f"anno_{exp_names[0]}{color_suffix}"].cat.categories
+    base_colors = plt.cm.tab20(np.linspace(0, 1, len(all_categories)))
+    palette = dict(zip(all_categories, base_colors))
+
+    # 2. Set up the subplot grid layout
+    num_exps = len(exp_names)
+    num_cols = min(4, num_exps) # Adjust grid width, max 4 columns
+    num_rows = (num_exps + num_cols - 1) // num_cols
+    fig, axes = plt.subplots(
+        num_rows, num_cols, 
+        figsize=(6 * num_cols, 5 * num_rows), 
+        squeeze=False, dpi=200
+    )
+    fig.suptitle(f"{title_prefix}\nSample: {library_id}", fontsize=20, y=1.02)
+
+    # 3. Common plotting parameters for all subplots
+    plot_params = dict(show=False, legend_loc=None, frameon=False,
+                       library_id=library_id, img_key='downscaled_fullres', size=1.2, s=s)
+
+    # 4. Iterate and create each spatial plot
+    for i, name in enumerate(exp_names):
+        r, c = divmod(i, num_cols)
+        ax = axes[r, c]
+        sc.pl.spatial(
+            adata_plot, 
+            color=f"anno_{name}{color_suffix}", 
+            title=name.replace(BASE_MODEL_NAME, '...'), # Shorten title
+            ax=ax, 
+            palette=palette, 
+            **plot_params
+        )
+
+    # 5. Hide any unused subplot axes
+    for i in range(num_exps, num_rows * num_cols):
+        r, c = divmod(i, num_cols)
+        axes[r, c].set_visible(False)
+
+    # 6. Create a single, shared legend for the entire figure
+    handles = [mpatches.Patch(color=palette[cat], label=cat) for cat in all_categories]
+    fig.legend(
+        handles=handles, title="Predicted Cell Types", 
+        loc='center right', bbox_to_anchor=(1.05, 0.5), 
+        fontsize=10, title_fontsize=12, frameon=False
+    )
+    plt.tight_layout(rect=[0, 0, 0.90, 0.96]) # Adjust layout to make space for legend
+    plt.show()
+
+print("✅ All utility functions are defined and ready.")
+# =========================================================
+# 3. DISCOVER EXPERIMENTS
+# =========================================================
+
+# Automatically find all trained SpaGLaM models in the specified directory
+experiments = discover_experiments(EXPERIMENTS_ROOT_DIR)
+
+# Manually insert the OmiCLIP baseline as the first experiment for comparison
+experiments.insert(0, {
+    "name": "OmiCLIP Baseline (No GNN)",
+    "path": YOUR_OMICLIP_CHECKPOINT,
+    "base_model_name": BASE_MODEL_NAME,
+    "is_baseline": True,
+})
+
+print(f"✅ Found {len(experiments)} experiments to run:")
+for i, e in enumerate(experiments):
+    is_baseline = "(Baseline)" if e['is_baseline'] else "(SpaGLaM)"
+    print(f"  {i+1}. {e['name']} {is_baseline}")
+# =========================================================
+# 4. LOAD SAMPLE & BUILD GRAPH (TENX156)
+# =========================================================
+# Initialize the dataset handler
+hest_dataset = HESTDataset(data_dir=HEST_DATA_DIR)
+
+# Load the specific sample by its ID
+sample_id_to_load = 'NCBI785'
+sample = hest_dataset.get_samples(sample_ids=[sample_id_to_load])[0]
+sample.load_st_data(lazy=False)
+sample.load_wsi()
+
+# Correct the AnnData spatial structure for compatibility with Scanpy
+spatial_data = sample.adata.uns['spatial']['ST']
+library_id = sample.sample_id
+sample.adata.uns['spatial'] = {library_id: spatial_data}
+
+# Create a copy for plotting to keep the original data pristine
+adata_plot = sample.adata.copy()
+print(f"✅ Sample '{sample.sample_id}' loaded successfully. Number of spots: {sample.adata.n_obs}")
+
+# Build the spatial graph based on physical coordinates (6-Nearest Neighbors)
+print("\nBuilding spatial KNN graph...")
+sc.pp.neighbors(sample.adata, use_rep='spatial', n_neighbors=6, key_added='spatial')
+print("✅ Graph constructed and stored in `adata.obsp['spatial_connectivities']`.")
+# =========================================================
+# 5. PRECOMPUTE IMAGE FEATURES (TENX156)
+# =========================================================
+precomp_device = AVAILABLE_DEVICES[0] # Use the first available GPU for this task
+all_spot_embeddings_cpu = precompute_omiclip_embeddings(
+    sample.adata, sample.wsi, YOUR_OMICLIP_CHECKPOINT, precomp_device, 
+    batch_size=512, num_workers=32
+)
+print(f"✅ Precomputed image features for {sample.adata.n_obs} spots. Feature matrix shape: {all_spot_embeddings_cpu.shape}")
+# =========================================================
+# 6. CONVERT TO PYTORCH GEOMETRIC (TENX156)
+# =========================================================
+# Convert adjacency matrix to edge_index format
+adj_csr: csr_matrix = sample.adata.obsp['spatial_connectivities'].tocsr()
+edge_index, edge_weight = from_scipy_sparse_matrix(adj_csr)
+
+# Convert other data to PyTorch tensors
+coords = torch.as_tensor(sample.adata.obsm['spatial'], dtype=torch.float32)
+x_image = all_spot_embeddings_cpu.clone().float()
+
+# Assemble the PyG Data object
+N = x_image.size(0)
+data_pyg = Data(edge_index=edge_index, num_nodes=N)
+data_pyg.x_image = x_image
+data_pyg.pos = coords
+data_pyg.edge_weight = edge_weight
+data_pyg.batch = torch.zeros(data_pyg.num_nodes, dtype=torch.long)
+
+# Create the crucial mapping from integer index back to spot ID
+node_idx_to_obs = np.array(sample.adata.obs_names.tolist())
+
+print("✅ Data converted to PyG format:")
+print(data_pyg)
+# =========================================================
+# 7. DEFINE TEXT QUERIES
+# =========================================================
+# A. Comprehensive multi-class annotation
+
+
+text_queries_binary = {
+    # IDC（浸润性导管癌）肿瘤细胞常见高表达/上调
+    "Tumor": "EPCAM TACSTD2 MUC1 KRT8 KRT18 KRT19 KRT7 GATA3 FOXA1 ESR1 PGR XBP1 TFF1 TFF3 AGR2 CLDN3 CLDN4 CLDN7 ERBB2 GRB7 PGAP3 STARD3 MIEN1 MKI67 TOP2A UBE2C BIRC5 CENPF CCNB1 CCNB2 CDK1 AURKA AURKB PLK1 TPX2 BUB1B KIF11 KIF2C KRT5 KRT14 KRT17 EGFR SOX10 ITGA6 ITGB4 LAMC2 LAMA3 SLC2A1",
+
+    # 在 IDC 中总体倾向于下调/低表达（抑癌 + 分化丢失 + 泌乳/腺泡分化）
+    "Normal Tissue": "PTEN PIK3R1 INPP4B RB1 CDKN1B FOXO3 RASSF1A NF1 ATM BRCA1 CHEK2 TP63 ACTA2 MYH11 TAGLN CNN1 CALD1 MYLK LALBA CSN2 CSN1S1 CSN3 BTN1A1 XDH MFGE8 STAT5A"
+}
+
+text_queries_binary_simple = {
+    "Tumor": "EPCAM KRT8 KRT18 KRT19 GATA3 ESR1 ERBB2 MKI67 TOP2A BIRC5",
+    "Normal Tissue": "PTEN PIK3R1 INPP4B RB1 CDKN1B FOXO3 BRCA1 ATM RASSF1A LALBA CSN2 TP63 ACTA2"
+}
+
+tokenizer = open_clip.get_tokenizer(BASE_MODEL_NAME)
+
+print("✅ Text queries for multiclass and binary classification defined.")
+# =========================================================
+# 8. RUN ZERO-SHOT INFERENCE (TENX156)
+# =========================================================
+
+
+# --- Run Detailed Binary Classification ---
+results_binary = run_all_experiments_fullgraph(
+    experiments=experiments,
+    data=data_pyg,
+    text_queries=text_queries_binary,
+    tokenizer=tokenizer,
+    devices=AVAILABLE_DEVICES
+)
+for name, res in results_binary.items():
+    adata_plot.obs[f"anno_{name}_2cat"] = pd.Categorical(res["labels"], categories=list(text_queries_binary.keys()))
+    adata_plot.obs[f"conf_{name}_2cat"] = res["confidences"]
+
+# --- Run Simplified Binary Classification ---
+results_binary_simple = run_all_experiments_fullgraph(
+    experiments=experiments,
+    data=data_pyg,
+    text_queries=text_queries_binary_simple,
+    tokenizer=tokenizer,
+    devices=AVAILABLE_DEVICES
+)
+for name, res in results_binary_simple.items():
+    adata_plot.obs[f"anno_{name}_2cat_simple"] = pd.Categorical(res["labels"], categories=list(text_queries_binary_simple.keys()))
+    adata_plot.obs[f"conf_{name}_2cat_simple"] = res["confidences"]
+
+print("\n✅ All experiments completed for TENX156 using full-graph forward pass.")
+# =========================================================
+# 9. VISUALIZE RESULTS (TENX156)
+# =========================================================
+
+print("--- 🎨 Binary Tumor vs Normal (Detailed Prompts) ---")
+plot_grid(
+    adata_plot, 
+    exp_names=[e['name'] for e in experiments], 
+    color_suffix="_2cat", 
+    title_prefix="Binary Tumor vs Normal (Detailed Prompts)", 
+    library_id=library_id
+)
+
+print("\n--- 🎨 Binary Tumor vs Normal (Simplified Prompts) ---")
+plot_grid(
+    adata_plot, 
+    exp_names=[e['name'] for e in experiments], 
+    color_suffix="_2cat_simple", 
+    title_prefix="Binary Tumor vs Normal (Simplified Prompts)", 
+    library_id=library_id
+)
+adata_plot.uns['spatial']
+sc.pl.spatial(
+    adata_plot,
+    s = 0,
+    library_id=library_id,
+    img_key="downscaled_fullres"
+)
+# Old Batch
+# -*- coding: utf-8 -*-
+"""
+Automated SpaGLaM vs. OmiCLIP Comparative Analysis (Batch-wise Inference)
+
+This script robustly analyzes and visualizes zero-shot spatial annotations from
+a series of SpaGLaM experiments using a memory-efficient, batch-wise subgraph
+inference strategy. It automatically discovers experiment configurations, finds
+the latest checkpoints, and runs a comparative analysis against a baseline OmiCLIP model.
+"""
+# ==============================================================================
+# 0. IMPORTS & SETUP
+# ==============================================================================
+import os
+import sys
+import re
+from pathlib import Path
+from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
+from typing import List, Dict, Any, Optional
+
+import torch
+import numpy as np
+import pandas as pd
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from tqdm.notebook import tqdm
+import scanpy as sc
+import anndata
+from scipy.sparse import csr_matrix
+
+import torch_geometric.data as pyg_data
+from torch_geometric.data import Batch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+
+# --- Project Imports ---
+PROJECT_ROOT = '/home1/jijh/diffusion_project/git_repo/GoldSpace'
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+import src.open_clip as open_clip
+from src.spaglam_preproc.utils.hest_loading import HESTDataset
+from src.spaglam_preproc.core.graph_builder import get_k_hop_neighborhood
+
+# ==============================================================================
+# 1. CONFIGURATION
+# ==============================================================================
+CONFIG = {
+    "devices": ["cuda:0", "cuda:1", "cuda:2"],
+    "data": {
+        "hest_dir": "/cwStorage/nodecw_group/jijh/hest_1k",
+        # --- NEW SAMPLE ID ---
+        "sample_id": "NCBI785",
+    },
+    "models": {
+        "omiclip_checkpoint": "/cwStorage/nodecw_group/jijh/training_log/cfff_train/openclip_train/train_log/finetune_20250623-092915/2025_06_23-09_30_48-model_ViT-B-32-lr_2e-05-b_1800-j_16-p_amp_bfloat16/checkpoints/epoch_25.pt",
+        "experiments_root": Path("/cwStorage/nodecw_group/jijh/trained_models/SpaGLaM_2Hops_test_trainlog"),
+        "base_model_name": "ViT-B-32",
+    },
+    "inference": {
+        "embedding_batch_size": 512,
+        "embedding_num_workers": 16, # Reduced for stability
+        "annotation_batch_size": 128, # Adjusted for subgraph batching
+        "k_hops": 2, # k-hop neighborhood for subgraphs
+    },
+    "output": {
+        "figure_dpi": 200,
+        "save_dir": Path("./analysis_results_NCBI785"),
+    }
+}
+CONFIG["output"]["save_dir"].mkdir(exist_ok=True, parents=True)
+
+
+
+
+
+# ==============================================================================
+# 3. CORE UTILITY FUNCTIONS
+# ==============================================================================
+
+def discover_experiments(cfg: Dict) -> List[Dict]:
+    """Scans experiment logs to automatically build the list of models to test."""
+    print("--- 🔬 Discovering experiments from training logs ---")
+    root_dir = cfg["models"]["experiments_root"]
+    experiments = [{"name": "OmiCLIP Baseline", "path": cfg["models"]["omiclip_checkpoint"], "is_baseline": True}]
+    
+    for exp_dir in sorted(root_dir.iterdir()):
+        if not exp_dir.is_dir(): continue
+        checkpoint_path = find_latest_checkpoint(exp_dir)
+        if not checkpoint_path: continue
+        
+        # Simplified parameter inference from name
+        name_lower = exp_dir.name.lower()
+        gnn_type = "graphtransformer" if "graphtf" in name_lower else "transformerconv" if "transformerconv" in name_lower else "gat"
+        
+        experiments.append({
+            "name": exp_dir.name, "path": checkpoint_path, "is_baseline": False,
+            "gnn_type": gnn_type, "use_residual_connection": "with-res" in name_lower,
+            "gnn_layers": 2, "gnn_hidden_dim": 512, "gnn_heads": 8, # Assumed constants
+        })
+        print(f"  + Found '{exp_dir.name}' (GNN: {gnn_type}, Residual: {'with-res' in name_lower})")
+    print(f"\nDiscovered {len(experiments)} total experiments to compare.")
+    return experiments
+
+def find_latest_checkpoint(exp_dir: Path) -> Optional[str]:
+    """Finds the best available checkpoint in an experiment directory."""
+    checkpoint_dir = exp_dir / "checkpoints"
+    if not checkpoint_dir.is_dir(): return None
+    for ckpt_name in ["epoch_45.pt", "epoch_latest.pt"]:
+        if (p := checkpoint_dir / ckpt_name).exists(): return str(p)
+    checkpoints = sorted(checkpoint_dir.glob("epoch_*.pt"), key=lambda p: int(p.stem.split('_')[1]))
+    return str(checkpoints[-1]) if checkpoints else None
+
+class WSISpotDataset(Dataset):
+    """A PyTorch Dataset for on-demand loading of WSI patches."""
+    def __init__(self, wsi, coords: np.ndarray, transform: callable):
+        self.wsi, self.coords, self.transform = wsi, coords, transform
+        self.patch_size = (224, 224)
+        self.patch_radius = self.patch_size[0] // 2
+    def __len__(self): return len(self.coords)
+    def __getitem__(self, idx: int):
+        c = self.coords[idx]
+        top_left = (int(c[0] - self.patch_radius), int(c[1] - self.patch_radius))
+        tile = self.wsi.read_region(top_left, 0, self.patch_size).convert("RGB")
+        return self.transform(tile)
+
+def precompute_spot_embeddings(sample: HESTSample, cfg: Dict) -> torch.Tensor:
+    """Pre-computes OmiCLIP image embeddings for all spots efficiently."""
+    print("\n--- 🖼️ Phase 1: Pre-computing global OmiCLIP embeddings for all spots ---")
+    device = torch.device(cfg["devices"][0])
+    model, preprocessor, _ = open_clip.create_model_and_transforms(
+        cfg["models"]["base_model_name"], pretrained=cfg["models"]["omiclip_checkpoint"], device=device
+    )
+    model.eval()
+    
+    dl = DataLoader(
+        WSISpotDataset(wsi=sample.wsi, coords=sample.adata.obsm['spatial'], transform=preprocessor),
+        batch_size=cfg["inference"]["embedding_batch_size"],
+        num_workers=cfg["inference"]["embedding_num_workers"],
+        shuffle=False, pin_memory=True
+    )
+    
+    all_features = []
+    with torch.inference_mode(), torch.cuda.amp.autocast():
+        for batch in tqdm(dl, desc="Encoding all spots"):
+            features = model.encode_image(batch.to(device), normalize=True)
+            all_features.append(features.cpu())
+            
+    final_features = torch.cat(all_features)
+    print(f"✅ Pre-computation complete. Embeddings shape: {final_features.shape}")
+    del model
+    torch.cuda.empty_cache()
+    return final_features
+
+def create_pyg_batch_for_inference(
+    center_spot_ids: List[str], adata: anndata.AnnData, 
+    adjacency_matrix: csr_matrix, k_hops: int
+) -> Optional[Batch]:
+    """
+    Builds a PyG Batch object from a list of center spots by creating a k-hop subgraph for each.
+    This is the core of the memory-efficient batch-wise inference strategy.
+    """
+    subgraph_list = []
+    for spot_id in center_spot_ids:
+        try:
+            center_node_idx = adata.obs_names.get_loc(spot_id)
+            all_global_indices = get_k_hop_neighborhood(adjacency_matrix, center_node_idx, k_hops)
+            global_to_local = {g_idx: l_idx for l_idx, g_idx in enumerate(all_global_indices)}
+            
+            edge_list = []
+            for u_global_idx in all_global_indices:
+                start, end = adjacency_matrix.indptr[u_global_idx], adjacency_matrix.indptr[u_global_idx + 1]
+                for v_global_idx in adjacency_matrix.indices[start:end]:
+                    if v_global_idx in global_to_local:
+                        edge_list.append([global_to_local[u_global_idx], global_to_local[v_global_idx]])
+            
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+            subgraph_list.append(pyg_data.Data(
+                edge_index=edge_index,
+                num_nodes=len(all_global_indices),
+                global_indices=torch.tensor(all_global_indices, dtype=torch.long)
+            ))
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to create subgraph for spot {spot_id}: {e}")
+            continue
+            
+    return Batch.from_data_list(subgraph_list) if subgraph_list else None
+
+def run_inference_worker(
+    exp_config: Dict, device_str: str, sample: HESTSample, text_queries: Dict,
+    tokenizer: callable, all_spot_embeddings: torch.Tensor, cfg: Dict
+) -> tuple[str, Dict]:
+    """Worker function to load one model and perform zero-shot annotation using batch-wise subgraph inference."""
+    device = torch.device(device_str)
+    all_spot_embeddings_gpu = all_spot_embeddings.to(device)
+
+    # 1. Load Model
+    base_model, _, _ = open_clip.create_model_and_transforms(
+        cfg["models"]["base_model_name"], pretrained=cfg["models"]["omiclip_checkpoint"])
+
+    if exp_config['is_baseline']:
+        model = base_model.to(device).eval()
+    else:
+        model_cfg = Namespace(freeze_omiclip=True, use_precomputed_embeddings=True, use_deep_fusion=False, **exp_config)
+        model = open_clip.SpaGLaM(open_clip_model=base_model, config=model_cfg)
+        state_dict = torch.load(exp_config['path'], map_location='cpu')['state_dict']
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        model.to(device).eval()
+
+    # 2. Encode Text Queries
+    query_labels = list(text_queries.keys())
+    tokenized_queries = tokenizer(list(text_queries.values())).to(device)
+    adj_matrix = sample.adata.obsp['spatial_connectivities'].tocsr()
+    spot_ids = sample.adata.obs.index
+    
+    all_preds, all_confs, annotated_spot_ids = [], [], []
+    with torch.inference_mode(), torch.cuda.amp.autocast():
+        text_encoder = model.omiclip_model.encode_text if not exp_config['is_baseline'] else model.encode_text
+        text_features = text_encoder(tokenized_queries, normalize=True)
+        
+        batch_size = cfg['inference']['annotation_batch_size']
+        for i in tqdm(range(0, len(spot_ids), batch_size), desc=f"Annotating ({exp_config['name']})", leave=False, ncols=100):
+            batch_spot_ids = spot_ids[i:i+batch_size].tolist()
+            
+            if exp_config['is_baseline']:
+                center_indices = sample.adata.obs.index.get_indexer(batch_spot_ids)
+                image_features = all_spot_embeddings_gpu[center_indices]
+            else:
+                graph_batch = create_pyg_batch_for_inference(
+                    batch_spot_ids, sample.adata, adj_matrix, k_hops=cfg['inference']['k_hops']
+                )
+                if graph_batch is None: continue
+                
+                graph_batch.x_image = all_spot_embeddings_gpu[graph_batch.global_indices]
+                graph_batch = graph_batch.to(device)
+                
+                # The model's forward pass performs global pooling, returning one feature per subgraph (i.e., per center spot)
+                image_features = model(graph_batch)['image_features'] # Already normalized
+            
+            sim = image_features @ text_features.T
+            conf, pred = torch.max(torch.softmax(sim, dim=1), dim=1)
+            all_preds.extend(pred.cpu().numpy())
+            all_confs.extend(conf.cpu().numpy())
+            annotated_spot_ids.extend(batch_spot_ids)
+
+    results = {
+        "labels": pd.Series([query_labels[i] for i in all_preds], index=annotated_spot_ids),
+        "confidences": pd.Series(all_confs, index=annotated_spot_ids)
+    }
+    del model, base_model, all_spot_embeddings_gpu
+    torch.cuda.empty_cache()
+    return exp_config['name'], results
+
+def run_analysis_pipeline(
+    analysis_name: str, text_queries: Dict, sample: HESTSample, 
+    all_spot_embeddings: torch.Tensor, experiments: List[Dict], cfg: Dict, adata_plot: sc.AnnData,
+):
+    """Orchestrates the parallel execution and plotting for a given set of text queries."""
+    print(f"\n--- 🚀 Phase 2: Running '{analysis_name}' analysis ---")
+    
+    tokenizer = open_clip.get_tokenizer(cfg["models"]["base_model_name"])
+    worker_fn = partial(
+        run_inference_worker, sample=sample, text_queries=text_queries,
+        tokenizer=tokenizer, all_spot_embeddings=all_spot_embeddings, cfg=cfg)
+
+    all_results = {}
+    with ThreadPoolExecutor(max_workers=len(cfg["devices"])) as executor:
+        futures = {executor.submit(worker_fn, exp, cfg["devices"][i % len(cfg["devices"])])
+                   for i, exp in enumerate(experiments)}
+        for future in tqdm(as_completed(futures), total=len(experiments), desc=f"Running {analysis_name}"):
+            exp_name, result = future.result()
+            all_results[exp_name] = result
+
+    # Create a fresh AnnData copy for this analysis's plots
+    categories = list(text_queries.keys())
+    sorted_results = {exp['name']: all_results[exp['name']] for exp in experiments}
+    for exp_name, res in sorted_results.items():
+        # Reindex results to match the full AnnData object, filling missing spots with NaN
+        adata_plot.obs[f"anno_{exp_name}"] = pd.Categorical(
+            res["labels"].reindex(adata_plot.obs_names), categories=categories
+        )
+        adata_plot.obs[f"conf_{exp_name}"] = res["confidences"].reindex(adata_plot.obs_names)
+
+    plot_results(adata_plot, analysis_name, experiments, sample, cfg)
+
+def plot_results(adata_plot, analysis_name, experiments, sample, cfg):
+    """Generates and saves a grid of spatial plots for comparison."""
+    categories = adata_plot.obs[f"anno_{experiments[0]['name']}"].cat.categories
+    palette = dict(zip(categories, plt.cm.tab10.colors[:len(categories)]))
+    
+    num_exps = len(experiments)
+    num_cols = min(4, num_exps)
+    num_rows = (num_exps + num_cols - 1) // num_cols
+    fig, axes = plt.subplots(
+        num_rows, num_cols, 
+        figsize=(6 * num_cols, 5.5 * num_rows), 
+        squeeze=False, dpi=cfg["output"]["figure_dpi"]
+    )
+    fig.suptitle(f"{analysis_name.replace('_', ' ')}: Sample {sample.sample_id}", fontsize=20, y=1.0)
+    
+    for i, exp in enumerate(experiments):
+        r, c = divmod(i, num_cols)
+        ax = axes[r, c]
+        sc.pl.spatial(
+            adata_plot, color=f"anno_{exp['name']}", title=exp['name'],
+            ax=ax, show=False, legend_loc=None, frameon=False, s=3, palette=palette, img_key='downscaled_fullres'
+        )
+        ax.set_title(ax.get_title(), fontsize=10)
+
+    for i in range(num_exps, num_rows * num_cols):
+        r, c = divmod(i, num_cols)
+        axes[r, c].set_visible(False)
+        
+    handles = [mpatches.Patch(color=color, label=cat) for cat, color in palette.items()]
+    fig.legend(handles=handles, title="Cell Types", loc='center right', bbox_to_anchor=(1.03, 0.5))
+    
+    plt.tight_layout(rect=[0, 0, 0.92, 0.95])
+    output_path = cfg["output"]["save_dir"] / f"annotation_{sample.sample_id}_{analysis_name}.png"
+    plt.savefig(output_path, dpi=cfg["output"]["figure_dpi"], bbox_inches='tight')
+    plt.show()
+    print(f"✅ Plot saved to {output_path}")
+
+
+
+
+
+
+# ==============================================================================
+# 4. MAIN EXECUTION WORKFLOW
+# ==============================================================================
+# ==============================================================================
+# 2. TEXT QUERIES (Updated for TENX99)
+# ==============================================================================
+# Using the new, more specific gene lists you provided for the TENX99 sample.
+TEXT_QUERIES = {
+    "binary": {
+        "name": "Binary_Tumor_vs_Normal",
+        "queries": {
+            # IDC（浸润性导管癌）肿瘤细胞常见高表达/上调
+            "Tumor": "EPCAM TACSTD2 MUC1 KRT8 KRT18 KRT19 KRT7 GATA3 FOXA1 ESR1 PGR XBP1 TFF1 TFF3 AGR2 CLDN3 CLDN4 CLDN7 ERBB2 GRB7 PGAP3 STARD3 MIEN1 MKI67 TOP2A UBE2C BIRC5 CENPF CCNB1 CCNB2 CDK1 AURKA AURKB PLK1 TPX2 BUB1B KIF11 KIF2C KRT5 KRT14 KRT17 EGFR SOX10 ITGA6 ITGB4 LAMC2 LAMA3 SLC2A1",
+
+            # 在 IDC 中总体倾向于下调/低表达（抑癌 + 分化丢失 + 泌乳/腺泡分化）
+            "Normal Tissue": "PTEN PIK3R1 INPP4B RB1 CDKN1B FOXO3 RASSF1A NF1 ATM BRCA1 CHEK2 TP63 ACTA2 MYH11 TAGLN CNN1 CALD1 MYLK LALBA CSN2 CSN1S1 CSN3 BTN1A1 XDH MFGE8 STAT5A"
+        }
+    },
+    "binary_simple": {
+        "name": "Simplified_Binary_Tumor_vs_Normal",
+        "queries": {
+            "Tumor": "EPCAM KRT8 KRT18 KRT19 GATA3 ESR1 ERBB2 MKI67 TOP2A BIRC5",
+            "Normal Tissue": "PTEN PIK3R1 INPP4B RB1 CDKN1B FOXO3 BRCA1 ATM RASSF1A LALBA CSN2 TP63 ACTA2"
+        }
+    }
+}
+
+"""Main function to run the entire analysis pipeline."""
+# 1. Discover experiments
+experiments = discover_experiments(CONFIG)
+
+# 2. Load data for the specified sample
+print(f"\n--- 📂 Loading and preparing sample: {CONFIG['data']['sample_id']} ---")
+hest_dataset = HESTDataset(data_dir=CONFIG["data"]["hest_dir"])
+sample = hest_dataset.get_samples(sample_ids=[CONFIG["data"]["sample_id"]])[0]
+sample.load_st_data(lazy=False)
+sample.load_wsi()
+adata_plot = sample.adata.copy()
+
+# Ensure spatial info is compatible with Scanpy
+spatial_data = sample.adata.uns['spatial']['ST']
+sample.adata.uns['spatial'] = {sample.sample_id: spatial_data}
+sc.pp.neighbors(sample.adata, use_rep='spatial', n_neighbors=6, key_added='spatial')
+print("✅ Sample loaded and spatial graph constructed.")
+
+# 3. Pre-compute image embeddings for all spots (one-time cost)
+all_spot_embeddings = precompute_spot_embeddings(sample, CONFIG)
+
+# 4. Run analysis for each set of text queries defined
+for analysis_key, analysis_config in TEXT_QUERIES.items():
+    run_analysis_pipeline(
+        analysis_name=analysis_config["name"],
+        text_queries=analysis_config["queries"],
+        sample=sample,
+        all_spot_embeddings=all_spot_embeddings,
+        experiments=experiments,
+        cfg=CONFIG,
+        adata_plot = adata_plot
+    )
+    
+print("\n🎉 All analyses complete!")

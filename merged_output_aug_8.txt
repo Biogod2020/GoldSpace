@@ -8153,18 +8153,17 @@ class MLPProjectionHead(nn.Module):
 # ==============================================================================
 class SpaGLaM(nn.Module):
     def __init__(self, open_clip_model: nn.Module, config: object):
+        # ... (__init__ 方法保持完全不变) ...
         super().__init__()
         self.config = config
         self.omiclip_model = open_clip_model
         self.use_precomputed_embeddings = getattr(config, 'use_precomputed_embeddings', False)
         
-        # 冻结策略
         if config.freeze_omiclip:
             for param in self.omiclip_model.parameters():
                 param.requires_grad = False
             self.omiclip_model.eval()
 
-        # 动态获取维度信息
         if hasattr(self.omiclip_model.visual, 'proj') and self.omiclip_model.visual.proj is not None:
              gnn_output_dim = self.omiclip_model.visual.proj.shape[1]
         else:
@@ -8172,18 +8171,15 @@ class SpaGLaM(nn.Module):
         gnn_input_dim = self.omiclip_model.visual.output_dim
         gnn_hidden_dim = config.gnn_hidden_dim
         
-        # --- 使用工厂和包装器构建GNN塔 ---
         self.gnn_layers_img = nn.ModuleList()
         self.gnn_layers_gene = nn.ModuleList()
         self.interaction_layers = nn.ModuleList() if config.use_deep_fusion else None
         
         current_dim = gnn_input_dim
         for _ in range(config.gnn_layers):
-            # 1. 从工厂创建基础GNN层
             img_layer = create_gnn_layer(config, current_dim, gnn_hidden_dim)
             gene_layer = create_gnn_layer(config, current_dim, gnn_hidden_dim)
             
-            # 2. 如果配置需要，则用残差连接包装它
             if getattr(config, 'use_residual_connection', False):
                 img_layer = ResidualGNNWrapper(img_layer)
                 gene_layer = ResidualGNNWrapper(gene_layer)
@@ -8196,45 +8192,68 @@ class SpaGLaM(nn.Module):
         self.gene_proj_head = MLPProjectionHead(gnn_hidden_dim, gnn_hidden_dim, gnn_output_dim)
         self.logit_scale = self.omiclip_model.logit_scale
 
-    def forward(self, batch: "torch_geometric.data.Batch") -> dict:
-        # 1. 初始特征提取 (与原来一致)
+# 文件路径: src/open_clip/spaglam_model.py
+
+    def forward_gnn(self, batch: "torch_geometric.data.Batch") -> (torch.Tensor, torch.Tensor):
+        """
+        Runs the GNN part of the model and returns node-level features before pooling.
+        这是新的、用于特征提取的函数。
+        """
+        # 1. 初始特征提取
         if self.training and not self.use_precomputed_embeddings:
             with torch.set_grad_enabled(not self.config.freeze_omiclip):
                 E_image = self.omiclip_model.encode_image(batch.x_image)
                 E_gene = self.omiclip_model.encode_text(batch.x_text)
         elif self.use_precomputed_embeddings:
-            E_image, E_gene = batch.x_image, batch.x_text
+            # SOTA 核心修复：安全地获取输入特征
+            # E_image 必须存在
+            E_image = batch.x_image
+            # E_gene 是可选的。如果不存在，创建一个兼容的零张量作为占位符。
+            # 这使得模型在只有图像输入的推理场景下也能正常工作。
+            E_gene = getattr(batch, 'x_text', torch.zeros_like(E_image))
         else: # Eval mode with raw data
             with torch.no_grad():
                 E_image = self.omiclip_model.encode_image(batch.x_image)
-                E_gene = self.omiclip_model.encode_text(batch.x_text)
+                # 同样地，安全处理 x_text
+                if hasattr(batch, 'x_text'):
+                    E_gene = self.omiclip_model.encode_text(batch.x_text)
+                else:
+                    E_gene = torch.zeros_like(E_image)
 
-        # 2. GNN传播
+        # 2. GNN传播 (这部分代码保持不变)
         img_feat, gene_feat = E_image, E_gene
         for i in range(self.config.gnn_layers):
-            # 根据GNN类型传递不同参数
             if self.config.gnn_type in ['gat', 'transformerconv']:
-                # GAT和TransformerConv都需要edge_index
                 img_feat = self.gnn_layers_img[i](img_feat, batch.edge_index)
                 gene_feat = self.gnn_layers_gene[i](gene_feat, batch.edge_index)
-            else: # 你的自定义GraphTransformer
-                # 它需要batch_index来进行掩码
+            else:
                 img_feat = self.gnn_layers_img[i](img_feat, batch.batch)
                 gene_feat = self.gnn_layers_gene[i](gene_feat, batch.batch)
             
-            # 激活函数
             img_feat = F.gelu(img_feat)
             gene_feat = F.gelu(gene_feat)
 
             if self.interaction_layers is not None:
                 img_feat, gene_feat = self.interaction_layers[i](img_feat, gene_feat)
         
-        # 3. 读出 (Readout) 和 投影 (与原来一致)
+        return img_feat, gene_feat
+
+    def forward(self, batch: "torch_geometric.data.Batch") -> dict:
+        """
+        The default forward pass for end-to-end training.
+        这个函数接口和功能都保持不变。
+        """
+        # 1. 获取节点级别的 GNN 特征
+        img_feat, gene_feat = self.forward_gnn(batch)
+        
+        # 2. 图级别读出 (Readout) 和 投影 (Projection)
         Z_image = global_mean_pool(img_feat, batch.batch)
         Z_gene = global_mean_pool(gene_feat, batch.batch)
+        
         final_image_features = self.image_proj_head(Z_image)
         final_text_features = self.gene_proj_head(Z_gene)
 
+        # 3. 返回与训练代码兼容的输出
         return {
             "image_features": F.normalize(final_image_features, dim=-1),
             "text_features": F.normalize(final_text_features, dim=-1),
