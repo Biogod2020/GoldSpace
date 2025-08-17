@@ -64,7 +64,14 @@ COMMON_ARGS=" \
 
 # --- 4. 实验定义 (保持不变) ---
 EXPERIMENTS=(
+    "Exp1_GAT_no-res;gat;1e-4;false"
+    "Exp2_GAT_with-res;gat;1e-4;true"
+    "Exp3_GraphTF_no-res;graphtransformer;1e-4;false"
+    "Exp4_GraphTF_with-res;graphtransformer;1e-4;true"
+    "Exp5_TransformerConv_no-res;transformerconv;1e-4;false"
     "Exp6_TransformerConv_with-res;transformerconv;1e-4;true"
+    "Exp7_GAT_with-res_lr-low;gat;5e-5;true"
+    "Exp8_TransformerConv_with-res_lr-low;transformerconv;5e-5;true"
 )
 
 # --- 5. 串行训练循环 (增加检查和跳过逻辑) ---
