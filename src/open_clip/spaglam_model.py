@@ -210,41 +210,41 @@ class SpaGLaM(nn.Module):
         
         return img_feat, gene_feat
 
-    def forward(self, batch: "torch_geometric.data.Batch") -> dict:
-        """
-        The default forward pass for end-to-end training.
-        这个函数接口和功能都保持不变。
-        """
-        # 1. 获取节点级别的 GNN 特征
-        img_feat, gene_feat = self.forward_gnn(batch)
+    def forward(self, batch):
+        gnn_mode   = getattr(self.config, "gnn_mode", "dual")
+        text_mode  = getattr(self.config, "text_pooler", "mean")
 
-        # 2. 图级别读出 (Readout) 和 投影 (Projection)
-        gnn_mode = getattr(self.config, "gnn_mode", "dual")
-        text_pooler = getattr(self.config, "text_pooler", "mean")
+        # 取节点级输入（你是预计算嵌入）
+        E_img_nodes = batch.x_image
+        E_txt_nodes = batch.x_text
 
-        if gnn_mode == "image_only" and text_pooler == "center":
-            # image：走 GNN + mean 池化
-            Z_image = global_mean_pool(img_feat, batch.batch)
-
-            # text：不进 GNN，直接取中心 spot（不池化）
-            if self.use_precomputed_embeddings:
-                E_txt_nodes = getattr(batch, "x_text", None)
-                assert E_txt_nodes is not None, "需要 batch.x_text 以支持文本分支（precomputed 模式）"
-            else:
-                with torch.set_grad_enabled(not self.config.freeze_omiclip):
-                    E_txt_nodes = self.omiclip_model.encode_text(batch.x_text)
-            Z_gene = self._select_centers(E_txt_nodes, batch)
+        # ---------- image 分支 ----------
+        if gnn_mode in ("dual", "image_only"):
+            # 只跑 image 侧 GNN
+            h_img = E_img_nodes
+            for layer in self.gnn_layers_img:
+                h_img = layer(h_img, batch.edge_index)
+            Z_image = global_mean_pool(h_img, batch.batch)
         else:
-            # 其他模式保持原逻辑：双侧 mean 池化
-            Z_image = global_mean_pool(img_feat, batch.batch)
-            Z_gene = global_mean_pool(gene_feat, batch.batch)
+            Z_image = global_mean_pool(E_img_nodes, batch.batch)
 
-        final_image_features = self.image_proj_head(Z_image)
-        final_text_features  = self.gene_proj_head(Z_gene)
+        # ---------- text 分支 ----------
+        if gnn_mode in ("dual", "text_only"):
+            # 只在需要时才跑 text 侧 GNN
+            h_txt = E_txt_nodes
+            for layer in self.gnn_layers_gene:
+                h_txt = layer(h_txt, batch.edge_index)
+            Z_gene = global_mean_pool(h_txt, batch.batch)
+        else:
+            # image_only：不进 GNN
+            if text_mode == "center":
+                Z_gene = self._select_centers(E_txt_nodes, batch)
+            else:
+                Z_gene = global_mean_pool(E_txt_nodes, batch.batch)
 
-        # 3. 返回与训练代码兼容的输出
-        return {
-            "image_features": F.normalize(final_image_features, dim=-1),
-            "text_features": F.normalize(final_text_features, dim=-1),
-            "logit_scale": self.logit_scale.exp(),
-        }
+        # 投影 + 归一化 + 返回
+        img_feat  = F.normalize(self.image_proj_head(Z_image), dim=-1)
+        text_feat = F.normalize(self.gene_proj_head(Z_gene),  dim=-1)
+        return {"image_features": img_feat,
+                "text_features":  text_feat,
+                "logit_scale":    self.logit_scale}
